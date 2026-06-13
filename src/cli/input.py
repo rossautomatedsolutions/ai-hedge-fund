@@ -4,9 +4,10 @@ from dateutil.relativedelta import relativedelta
 import argparse
 import questionary
 from colorama import Fore, Style
+import re
 
 from src.utils.analysts import ANALYST_ORDER
-from src.llm.models import LLM_ORDER, OLLAMA_LLM_ORDER, get_model_info, ModelProvider, find_model_by_name
+from src.llm.models import LLM_ORDER, OLLAMA_LLM_ORDER, get_model_info, ModelProvider, find_model_by_name, find_ollama_model_by_name
 from src.utils.ollama import ensure_ollama_and_model
 
 from dataclasses import dataclass
@@ -43,6 +44,13 @@ def add_common_args(
     if include_ollama:
         parser.add_argument("--ollama", action="store_true", help="Use Ollama for local LLM inference")
     parser.add_argument("--model", type=str, required=False, help="Model name to use (e.g., gpt-4o)")
+    parser.add_argument(
+        "--no-interactive",
+        "--non-interactive",
+        dest="no_interactive",
+        action="store_true",
+        help="Fail with a clear error instead of prompting for input",
+    )
     return parser
 
 
@@ -104,19 +112,78 @@ def select_analysts(flags: dict | None = None) -> list[str]:
     return choices
 
 
-def select_model(use_ollama: bool, model_flag: str | None = None) -> tuple[str, str]:
+def _normalize_ollama_alias(model_name: str) -> str:
+    normalized = model_name.strip()
+    if not normalized:
+        return normalized
+
+    exact_model = find_ollama_model_by_name(normalized)
+    if exact_model:
+        return exact_model.model_name
+
+    alias_map = {
+        "llama3.1": "llama3.1:latest",
+        "llama3.1:8b": "llama3.1:latest",
+    }
+    if normalized in alias_map:
+        return alias_map[normalized]
+
+    if ":" not in normalized:
+        latest_variant = find_ollama_model_by_name(f"{normalized}:latest")
+        if latest_variant:
+            return latest_variant.model_name
+
+    prefix = re.sub(r":(latest|\d+b.*)$", "", normalized)
+    prefix_matches = [model_name for _, model_name, _ in OLLAMA_LLM_ORDER if model_name.startswith(prefix)]
+    if len(prefix_matches) == 1:
+        return prefix_matches[0]
+
+    return normalized
+
+
+def resolve_model_selection(use_ollama: bool, model_flag: str | None = None) -> tuple[str, str] | None:
+    if not model_flag:
+        return None
+
+    if use_ollama:
+        resolved_name = _normalize_ollama_alias(model_flag)
+        model = find_ollama_model_by_name(resolved_name)
+        if model:
+            return model.model_name, ModelProvider.OLLAMA.value
+        return resolved_name, ModelProvider.OLLAMA.value
+
+    model = find_model_by_name(model_flag)
+    if model:
+        return model.model_name, model.provider.value
+    return None
+
+
+def select_model(use_ollama: bool, model_flag: str | None = None, *, no_interactive: bool = False) -> tuple[str, str]:
     model_name: str = ""
     model_provider: str | None = None
 
     if model_flag:
-        model = find_model_by_name(model_flag)
-        if model:
+        resolved = resolve_model_selection(use_ollama, model_flag)
+        if resolved:
+            model_name, model_provider = resolved
             print(
-                f"\nUsing specified model: {Fore.CYAN}{model.provider.value}{Style.RESET_ALL} - {Fore.GREEN + Style.BRIGHT}{model.model_name}{Style.RESET_ALL}\n"
+                f"\nUsing specified model: {Fore.CYAN}{model_provider}{Style.RESET_ALL} - {Fore.GREEN + Style.BRIGHT}{model_name}{Style.RESET_ALL}\n"
             )
-            return model.model_name, model.provider.value
-        else:
-            print(f"{Fore.RED}Model '{model_flag}' not found. Please select a model.{Style.RESET_ALL}")
+            if use_ollama:
+                if not ensure_ollama_and_model(model_name, interactive=not no_interactive):
+                    print(f"{Fore.RED}Cannot proceed without Ollama and the selected model.{Style.RESET_ALL}")
+                    sys.exit(1)
+            return model_name, model_provider
+
+        if no_interactive:
+            print(f"{Fore.RED}Model '{model_flag}' not found and interactive selection is disabled.{Style.RESET_ALL}")
+            sys.exit(1)
+
+        print(f"{Fore.RED}Model '{model_flag}' not found. Please select a model.{Style.RESET_ALL}")
+
+    if no_interactive:
+        print(f"{Fore.RED}A model must be provided when --no-interactive is set.{Style.RESET_ALL}")
+        sys.exit(1)
 
     if use_ollama:
         print(f"{Fore.CYAN}Using Ollama for local LLM inference.{Style.RESET_ALL}")
@@ -143,7 +210,7 @@ def select_model(use_ollama: bool, model_flag: str | None = None) -> tuple[str, 
                 print("\n\nInterrupt received. Exiting...")
                 sys.exit(0)
 
-        if not ensure_ollama_and_model(model_name):
+        if not ensure_ollama_and_model(model_name, interactive=not no_interactive):
             print(f"{Fore.RED}Cannot proceed without Ollama and the selected model.{Style.RESET_ALL}")
             sys.exit(1)
 
@@ -270,7 +337,11 @@ def parse_cli_inputs(
         "analysts_all": getattr(args, "analysts_all", False),
         "analysts": getattr(args, "analysts", None),
     })
-    model_name, model_provider = select_model(getattr(args, "ollama", False), getattr(args, "model", None))
+    model_name, model_provider = select_model(
+        getattr(args, "ollama", False),
+        getattr(args, "model", None),
+        no_interactive=getattr(args, "no_interactive", False),
+    )
     start_date, end_date = resolve_dates(getattr(args, "start_date", None), getattr(args, "end_date", None), default_months_back=default_months_back)
 
     return CLIInputs(

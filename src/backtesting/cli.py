@@ -9,10 +9,9 @@ from colorama import Fore, Style, init
 import questionary
 
 from .engine import BacktestEngine
-from src.llm.models import LLM_ORDER, OLLAMA_LLM_ORDER, get_model_info, ModelProvider
 from src.utils.analysts import ANALYST_ORDER
+from src.cli.input import select_model
 from src.main import run_hedge_fund
-from src.utils.ollama import ensure_ollama_and_model
 
 
 def main() -> int:
@@ -35,6 +34,8 @@ def main() -> int:
     parser.add_argument("--analysts", type=str, required=False)
     parser.add_argument("--analysts-all", action="store_true")
     parser.add_argument("--ollama", action="store_true")
+    parser.add_argument("--model", type=str, required=False)
+    parser.add_argument("--no-interactive", "--non-interactive", dest="no_interactive", action="store_true")
 
     args = parser.parse_args()
     init(autoreset=True)
@@ -71,62 +72,7 @@ def main() -> int:
             f"{', '.join(Fore.GREEN + choice.title().replace('_', ' ') + Style.RESET_ALL for choice in choices)}\n"
         )
 
-    # Model selection simplified: default to first ordered model or Ollama flag
-    if args.ollama:
-        print(f"{Fore.CYAN}Using Ollama for local LLM inference.{Style.RESET_ALL}")
-        model_name = questionary.select(
-            "Select your Ollama model:",
-            choices=[questionary.Choice(display, value=value) for display, value, _ in OLLAMA_LLM_ORDER],
-            style=questionary.Style(
-                [
-                    ("selected", "fg:green bold"),
-                    ("pointer", "fg:green bold"),
-                    ("highlighted", "fg:green"),
-                    ("answer", "fg:green bold"),
-                ]
-            ),
-        ).ask()
-        if not model_name:
-            print("\n\nInterrupt received. Exiting...")
-            return 1
-        if model_name == "-":
-            model_name = questionary.text("Enter the custom model name:").ask()
-            if not model_name:
-                print("\n\nInterrupt received. Exiting...")
-                return 1
-        if not ensure_ollama_and_model(model_name):
-            print(f"{Fore.RED}Cannot proceed without Ollama and the selected model.{Style.RESET_ALL}")
-            return 1
-        model_provider = ModelProvider.OLLAMA.value
-        print(
-            f"\nSelected {Fore.CYAN}Ollama{Style.RESET_ALL} model: {Fore.GREEN + Style.BRIGHT}{model_name}{Style.RESET_ALL}\n"
-        )
-    else:
-        model_choice = questionary.select(
-            "Select your LLM model:",
-            choices=[questionary.Choice(display, value=(name, provider)) for display, name, provider in LLM_ORDER],
-            style=questionary.Style(
-                [
-                    ("selected", "fg:green bold"),
-                    ("pointer", "fg:green bold"),
-                    ("highlighted", "fg:green"),
-                    ("answer", "fg:green bold"),
-                ]
-            ),
-        ).ask()
-        if not model_choice:
-            print("\n\nInterrupt received. Exiting...")
-            return 1
-        model_name, model_provider = model_choice
-        model_info = get_model_info(model_name, model_provider)
-        if model_info and model_info.is_custom():
-            model_name = questionary.text("Enter the custom model name:").ask()
-            if not model_name:
-                print("\n\nInterrupt received. Exiting...")
-                return 1
-        print(
-            f"\nSelected {Fore.CYAN}{model_provider}{Style.RESET_ALL} model: {Fore.GREEN + Style.BRIGHT}{model_name}{Style.RESET_ALL}\n"
-        )
+    model_name, model_provider = select_model(args.ollama, args.model, no_interactive=args.no_interactive)
 
     engine = BacktestEngine(
         agent=run_hedge_fund,

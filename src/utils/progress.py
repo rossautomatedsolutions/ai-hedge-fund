@@ -1,10 +1,11 @@
 from datetime import datetime, timezone
+from typing import Callable, Dict, List, Optional
+
 from rich.console import Console
 from rich.live import Live
-from rich.table import Table
 from rich.style import Style
+from rich.table import Table
 from rich.text import Text
-from typing import Dict, Optional, Callable, List
 
 console = Console()
 
@@ -22,7 +23,7 @@ class AgentProgress:
     def register_handler(self, handler: Callable[[str, Optional[str], str], None]):
         """Register a handler to be called when agent status updates."""
         self.update_handlers.append(handler)
-        return handler  # Return handler to support use as decorator
+        return handler
 
     def unregister_handler(self, handler: Callable[[str, Optional[str], str], None]):
         """Unregister a previously registered handler."""
@@ -52,12 +53,10 @@ class AgentProgress:
             self.agent_status[agent_name]["status"] = status
         if analysis:
             self.agent_status[agent_name]["analysis"] = analysis
-        
-        # Set the timestamp as UTC datetime
+
         timestamp = datetime.now(timezone.utc).isoformat()
         self.agent_status[agent_name]["timestamp"] = timestamp
 
-        # Notify all registered handlers
         for handler in self.update_handlers:
             handler(agent_name, ticker, status, analysis, timestamp)
 
@@ -65,7 +64,14 @@ class AgentProgress:
 
     def get_all_status(self):
         """Get the current status of all agents as a dictionary."""
-        return {agent_name: {"ticker": info["ticker"], "status": info["status"], "display_name": self._get_display_name(agent_name)} for agent_name, info in self.agent_status.items()}
+        return {
+            agent_name: {
+                "ticker": info["ticker"],
+                "status": info["status"],
+                "display_name": self._get_display_name(agent_name),
+            }
+            for agent_name, info in self.agent_status.items()
+        }
 
     def _get_display_name(self, agent_name: str) -> str:
         """Convert agent_name to a display-friendly format."""
@@ -76,7 +82,6 @@ class AgentProgress:
         self.table.columns.clear()
         self.table.add_column(width=100)
 
-        # Sort agents with Risk Management and Portfolio Management at the bottom
         def sort_key(item):
             agent_name = item[0]
             if "risk_management" in agent_name:
@@ -89,16 +94,15 @@ class AgentProgress:
         for agent_name, info in sorted(self.agent_status.items(), key=sort_key):
             status = info["status"]
             ticker = info["ticker"]
-            # Create the status text with appropriate styling
             if status.lower() == "done":
                 style = Style(color="green", bold=True)
-                symbol = "✓"
+                symbol = "[OK]"
             elif status.lower() == "error":
                 style = Style(color="red", bold=True)
-                symbol = "✗"
+                symbol = "[X]"
             else:
                 style = Style(color="yellow")
-                symbol = "⋯"
+                symbol = "..."
 
             agent_display = self._get_display_name(agent_name)
             status_text = Text()
@@ -112,5 +116,4 @@ class AgentProgress:
             self.table.add_row(status_text)
 
 
-# Create a global instance
 progress = AgentProgress()

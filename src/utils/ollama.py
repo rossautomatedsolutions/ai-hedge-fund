@@ -308,7 +308,7 @@ def download_model(model_name: str) -> bool:
         return False
 
 
-def ensure_ollama_and_model(model_name: str) -> bool:
+def ensure_ollama_and_model(model_name: str, *, interactive: bool = True) -> bool:
     """Ensure Ollama is installed, running, and the requested model is available."""
     ollama_url = _get_ollama_base_url()
     env_override = os.environ.get("OLLAMA_BASE_URL")
@@ -321,7 +321,10 @@ def ensure_ollama_and_model(model_name: str) -> bool:
     # Check if Ollama is installed
     if not is_ollama_installed():
         print(f"{Fore.YELLOW}Ollama is not installed on your system.{Style.RESET_ALL}")
-        
+        if not interactive:
+            print(f"{Fore.RED}Non-interactive mode cannot install Ollama automatically.{Style.RESET_ALL}")
+            return False
+
         # Ask if they want to install it
         if questionary.confirm("Do you want to install Ollama?").ask():
             if not install_ollama():
@@ -340,6 +343,9 @@ def ensure_ollama_and_model(model_name: str) -> bool:
     available_models = get_locally_available_models()
     if model_name not in available_models:
         print(f"{Fore.YELLOW}Model {model_name} is not available locally.{Style.RESET_ALL}")
+        if not interactive:
+            print(f"{Fore.RED}Non-interactive mode will not download missing Ollama models. Run `ollama pull {model_name}` first.{Style.RESET_ALL}")
+            return False
         
         # Ask if they want to download it
         model_size_info = ""

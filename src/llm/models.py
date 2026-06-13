@@ -136,6 +136,11 @@ def find_model_by_name(model_name: str) -> LLMModel | None:
     return next((model for model in all_models if model.model_name == model_name), None)
 
 
+def find_ollama_model_by_name(model_name: str) -> LLMModel | None:
+    """Find an Ollama model by its exact model name."""
+    return next((model for model in OLLAMA_MODELS if model.model_name == model_name), None)
+
+
 def get_models_list():
     """Get the list of models for API responses."""
     return [

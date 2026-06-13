@@ -3,6 +3,7 @@ from tabulate import tabulate
 from .analysts import ANALYST_ORDER
 import os
 import json
+from collections.abc import Mapping
 
 
 def sort_agent_signals(signals):
@@ -14,6 +15,59 @@ def sort_agent_signals(signals):
     return sorted(signals, key=lambda x: analyst_order.get(x[0], 999))
 
 
+def _wrap_text(value: str, width: int = 60) -> str:
+    text = (value or "").strip()
+    if not text:
+        return ""
+
+    lines: list[str] = []
+    current_line = ""
+    for word in text.split():
+        if len(current_line) + len(word) + 1 > width:
+            lines.append(current_line)
+            current_line = word
+        else:
+            current_line = f"{current_line} {word}".strip()
+
+    if current_line:
+        lines.append(current_line)
+
+    return "\n".join(lines)
+
+
+def _stringify_reasoning(reasoning) -> str:
+    if reasoning in (None, ""):
+        return "N/A"
+    if isinstance(reasoning, str):
+        return _wrap_text(reasoning)
+    if isinstance(reasoning, (dict, list)):
+        return _wrap_text(json.dumps(reasoning, indent=2, ensure_ascii=True))
+    return _wrap_text(str(reasoning))
+
+
+def _format_confidence(confidence) -> str:
+    if confidence in (None, ""):
+        return "N/A"
+    try:
+        return f"{float(confidence):.1f}%"
+    except (TypeError, ValueError):
+        return str(confidence)
+
+
+def _format_quantity(quantity) -> str:
+    if quantity in (None, ""):
+        return "N/A"
+    return str(quantity)
+
+
+def _safe_mapping(value) -> Mapping:
+    return value if isinstance(value, Mapping) else {}
+
+
+def _agent_display_name(agent_key: str) -> str:
+    return agent_key.replace("_agent", "").replace("_", " ").title()
+
+
 def print_trading_output(result: dict) -> None:
     """
     Print formatted trading results with colored tables for multiple tickers.
@@ -22,76 +76,57 @@ def print_trading_output(result: dict) -> None:
         result (dict): Dictionary containing decisions and analyst signals for multiple tickers
     """
     decisions = result.get("decisions")
-    if not decisions:
+    if not isinstance(decisions, Mapping) or not decisions:
         print(f"{Fore.RED}No trading decisions available{Style.RESET_ALL}")
         return
 
+    analyst_signals = result.get("analyst_signals", {})
+    if not isinstance(analyst_signals, Mapping):
+        analyst_signals = {}
+
     # Print decisions for each ticker
     for ticker, decision in decisions.items():
+        decision = _safe_mapping(decision)
         print(f"\n{Fore.WHITE}{Style.BRIGHT}Analysis for {Fore.CYAN}{ticker}{Style.RESET_ALL}")
         print(f"{Fore.WHITE}{Style.BRIGHT}{'=' * 50}{Style.RESET_ALL}")
 
         # Prepare analyst signals table for this ticker
         table_data = []
-        for agent, signals in result.get("analyst_signals", {}).items():
-            if ticker not in signals:
-                continue
-                
-            # Skip Risk Management agent in the signals section
+        for agent, signals in analyst_signals.items():
             if agent == "risk_management_agent":
                 continue
+            if not isinstance(signals, Mapping) or ticker not in signals:
+                continue
 
-            signal = signals[ticker]
-            agent_name = agent.replace("_agent", "").replace("_", " ").title()
-            signal_type = signal.get("signal", "").upper()
-            confidence = signal.get("confidence", 0)
+            agent_name = _agent_display_name(agent)
+            raw_signal = signals[ticker]
+            if not isinstance(raw_signal, Mapping):
+                table_data.append(
+                    [
+                        agent_name,
+                        "WARNING",
+                        "N/A",
+                        _stringify_reasoning({"warning": "Malformed signal payload", "payload": raw_signal}),
+                    ]
+                )
+                continue
+
+            signal_type = str(raw_signal.get("signal") or "UNKNOWN").upper()
+            confidence = _format_confidence(raw_signal.get("confidence"))
 
             signal_color = {
                 "BULLISH": Fore.GREEN,
                 "BEARISH": Fore.RED,
                 "NEUTRAL": Fore.YELLOW,
+                "WARNING": Fore.MAGENTA,
             }.get(signal_type, Fore.WHITE)
-            
-            # Get reasoning if available
-            reasoning_str = ""
-            if "reasoning" in signal and signal["reasoning"]:
-                reasoning = signal["reasoning"]
-                
-                # Handle different types of reasoning (string, dict, etc.)
-                if isinstance(reasoning, str):
-                    reasoning_str = reasoning
-                elif isinstance(reasoning, dict):
-                    # Convert dict to string representation
-                    reasoning_str = json.dumps(reasoning, indent=2)
-                else:
-                    # Convert any other type to string
-                    reasoning_str = str(reasoning)
-                
-                # Wrap long reasoning text to make it more readable
-                wrapped_reasoning = ""
-                current_line = ""
-                # Use a fixed width of 60 characters to match the table column width
-                max_line_length = 60
-                for word in reasoning_str.split():
-                    if len(current_line) + len(word) + 1 > max_line_length:
-                        wrapped_reasoning += current_line + "\n"
-                        current_line = word
-                    else:
-                        if current_line:
-                            current_line += " " + word
-                        else:
-                            current_line = word
-                if current_line:
-                    wrapped_reasoning += current_line
-                
-                reasoning_str = wrapped_reasoning
 
             table_data.append(
                 [
-                    f"{Fore.CYAN}{agent_name}{Style.RESET_ALL}",
+                    agent_name,
                     f"{signal_color}{signal_type}{Style.RESET_ALL}",
-                    f"{Fore.WHITE}{confidence}%{Style.RESET_ALL}",
-                    f"{Fore.WHITE}{reasoning_str}{Style.RESET_ALL}",
+                    f"{Fore.WHITE}{confidence}{Style.RESET_ALL}",
+                    f"{Fore.WHITE}{_stringify_reasoning(raw_signal.get('reasoning'))}{Style.RESET_ALL}",
                 ]
             )
 
@@ -109,7 +144,7 @@ def print_trading_output(result: dict) -> None:
         )
 
         # Print Trading Decision Table
-        action = decision.get("action", "").upper()
+        action = str(decision.get("action") or "UNKNOWN").upper()
         action_color = {
             "BUY": Fore.GREEN,
             "SELL": Fore.RED,
@@ -118,34 +153,14 @@ def print_trading_output(result: dict) -> None:
             "SHORT": Fore.RED,
         }.get(action, Fore.WHITE)
 
-        # Get reasoning and format it
-        reasoning = decision.get("reasoning", "")
-        # Wrap long reasoning text to make it more readable
-        wrapped_reasoning = ""
-        if reasoning:
-            current_line = ""
-            # Use a fixed width of 60 characters to match the table column width
-            max_line_length = 60
-            for word in reasoning.split():
-                if len(current_line) + len(word) + 1 > max_line_length:
-                    wrapped_reasoning += current_line + "\n"
-                    current_line = word
-                else:
-                    if current_line:
-                        current_line += " " + word
-                    else:
-                        current_line = word
-            if current_line:
-                wrapped_reasoning += current_line
-
         decision_data = [
             ["Action", f"{action_color}{action}{Style.RESET_ALL}"],
-            ["Quantity", f"{action_color}{decision.get('quantity')}{Style.RESET_ALL}"],
+            ["Quantity", f"{action_color}{_format_quantity(decision.get('quantity'))}{Style.RESET_ALL}"],
             [
                 "Confidence",
-                f"{Fore.WHITE}{decision.get('confidence'):.1f}%{Style.RESET_ALL}",
+                f"{Fore.WHITE}{_format_confidence(decision.get('confidence'))}{Style.RESET_ALL}",
             ],
-            ["Reasoning", f"{Fore.WHITE}{wrapped_reasoning}{Style.RESET_ALL}"],
+            ["Reasoning", f"{Fore.WHITE}{_stringify_reasoning(decision.get('reasoning'))}{Style.RESET_ALL}"],
         ]
         
         print(f"\n{Fore.WHITE}{Style.BRIGHT}TRADING DECISION:{Style.RESET_ALL} [{Fore.CYAN}{ticker}{Style.RESET_ALL}]")
@@ -162,9 +177,9 @@ def print_trading_output(result: dict) -> None:
             portfolio_manager_reasoning = decision.get("reasoning")
             break
             
-    analyst_signals = result.get("analyst_signals", {})
     for ticker, decision in decisions.items():
-        action = decision.get("action", "").upper()
+        decision = _safe_mapping(decision)
+        action = str(decision.get("action") or "UNKNOWN").upper()
         action_color = {
             "BUY": Fore.GREEN,
             "SELL": Fore.RED,
@@ -179,8 +194,8 @@ def print_trading_output(result: dict) -> None:
         neutral_count = 0
         if analyst_signals:
             for agent, signals in analyst_signals.items():
-                if ticker in signals:
-                    signal = signals[ticker].get("signal", "").upper()
+                if isinstance(signals, Mapping) and ticker in signals and isinstance(signals[ticker], Mapping):
+                    signal = str(signals[ticker].get("signal") or "").upper()
                     if signal == "BULLISH":
                         bullish_count += 1
                     elif signal == "BEARISH":
@@ -192,8 +207,8 @@ def print_trading_output(result: dict) -> None:
             [
                 f"{Fore.CYAN}{ticker}{Style.RESET_ALL}",
                 f"{action_color}{action}{Style.RESET_ALL}",
-                f"{action_color}{decision.get('quantity')}{Style.RESET_ALL}",
-                f"{Fore.WHITE}{decision.get('confidence'):.1f}%{Style.RESET_ALL}",
+                f"{action_color}{_format_quantity(decision.get('quantity'))}{Style.RESET_ALL}",
+                f"{Fore.WHITE}{_format_confidence(decision.get('confidence'))}{Style.RESET_ALL}",
                 f"{Fore.GREEN}{bullish_count}{Style.RESET_ALL}",
                 f"{Fore.RED}{bearish_count}{Style.RESET_ALL}",
                 f"{Fore.YELLOW}{neutral_count}{Style.RESET_ALL}",
@@ -222,36 +237,8 @@ def print_trading_output(result: dict) -> None:
     
     # Print Portfolio Manager's reasoning if available
     if portfolio_manager_reasoning:
-        # Handle different types of reasoning (string, dict, etc.)
-        reasoning_str = ""
-        if isinstance(portfolio_manager_reasoning, str):
-            reasoning_str = portfolio_manager_reasoning
-        elif isinstance(portfolio_manager_reasoning, dict):
-            # Convert dict to string representation
-            reasoning_str = json.dumps(portfolio_manager_reasoning, indent=2)
-        else:
-            # Convert any other type to string
-            reasoning_str = str(portfolio_manager_reasoning)
-            
-        # Wrap long reasoning text to make it more readable
-        wrapped_reasoning = ""
-        current_line = ""
-        # Use a fixed width of 60 characters to match the table column width
-        max_line_length = 60
-        for word in reasoning_str.split():
-            if len(current_line) + len(word) + 1 > max_line_length:
-                wrapped_reasoning += current_line + "\n"
-                current_line = word
-            else:
-                if current_line:
-                    current_line += " " + word
-                else:
-                    current_line = word
-        if current_line:
-            wrapped_reasoning += current_line
-            
         print(f"\n{Fore.WHITE}{Style.BRIGHT}Portfolio Strategy:{Style.RESET_ALL}")
-        print(f"{Fore.CYAN}{wrapped_reasoning}{Style.RESET_ALL}")
+        print(f"{Fore.CYAN}{_stringify_reasoning(portfolio_manager_reasoning)}{Style.RESET_ALL}")
 
 
 def print_backtest_results(table_rows: list) -> None:
