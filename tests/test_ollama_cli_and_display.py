@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
+import requests
 
 from src.basket_runner import BasketRunConfig, run_basket
 from src.cli.input import resolve_model_selection, select_model
+from src.data_diagnostics import run_ticker_data_check
 from src.utils.display import print_trading_output
 
 
@@ -82,6 +85,7 @@ def test_basket_runner_dry_run_writes_manifest_and_summary(tmp_path: Path) -> No
         start_date=None,
         end_date=None,
         dry_run=True,
+        data_check_only=False,
         analysts=["fundamentals_analyst", "technical_analyst", "valuation_analyst"],
     )
 
@@ -96,11 +100,42 @@ def test_basket_runner_dry_run_writes_manifest_and_summary(tmp_path: Path) -> No
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert manifest["tickers"] == ["BB", "GME"]
     assert manifest["dry_run"] is True
+    assert (run_dir / "failures.json").exists()
+    assert (run_dir / "data_check.json").exists()
 
 
 def test_basket_runner_continue_on_error_writes_failures(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("src.basket_runner.ensure_ollama_and_model", lambda model, interactive=False: True)
     monkeypatch.setattr("src.basket_runner.print_trading_output", lambda result: None)
+    monkeypatch.setattr(
+        "src.basket_runner.run_ticker_data_check",
+        lambda ticker, start_date, end_date: type(
+            "Check",
+            (),
+            {
+                "ticker": ticker,
+                "ok": True,
+                "classification": "ok",
+                "diagnosis": "All good",
+                "env_var": "FINANCIAL_DATASETS_API_KEY",
+                "checked_at": "2026-06-13T00:00:00",
+                "checks": [],
+            },
+        )(),
+    )
+    monkeypatch.setattr(
+        "src.basket_runner.ticker_data_check_to_dict",
+        lambda result: {
+            "ticker": result.ticker,
+            "ok": result.ok,
+            "classification": result.classification,
+            "diagnosis": result.diagnosis,
+            "env_var": result.env_var,
+            "checked_at": result.checked_at,
+            "checks": result.checks,
+        },
+    )
+    monkeypatch.setattr("src.basket_runner.format_ticker_data_check", lambda result: json.dumps({"ticker": result.ticker}))
 
     calls = {"count": 0}
 
@@ -134,6 +169,7 @@ def test_basket_runner_continue_on_error_writes_failures(tmp_path: Path, monkeyp
         start_date=None,
         end_date=None,
         dry_run=False,
+        data_check_only=False,
         analysts=["fundamentals_analyst"],
     )
 
@@ -143,6 +179,118 @@ def test_basket_runner_continue_on_error_writes_failures(tmp_path: Path, monkeyp
     summary = (run_dir / "run_summary.md").read_text(encoding="utf-8")
     combined_csv = (run_dir / "combined_decisions.csv").read_text(encoding="utf-8")
 
-    assert failures == [{"ticker": "BB", "error": "boom-BB"}]
+    assert failures[0]["ticker"] == "BB"
+    assert failures[0]["error"] == "boom-BB"
+    assert failures[0]["classification"] == "unknown_error"
     assert "Failures" in summary
     assert "GME" in combined_csv
+
+
+def test_run_ticker_data_check_classifies_missing_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("FINANCIAL_DATASETS_API_KEY", raising=False)
+
+    def fake_get(url, headers, timeout):
+        response = Mock()
+        response.status_code = 401
+        response.text = "Unauthorized"
+        response.json.return_value = {"detail": "Unauthorized"}
+        return response
+
+    monkeypatch.setattr("src.data_diagnostics.requests.get", fake_get)
+    monkeypatch.setattr("src.data_diagnostics.requests.post", lambda url, headers, json, timeout: fake_get(url, headers, timeout))
+
+    result = run_ticker_data_check("BB", "2026-01-01", "2026-06-01")
+
+    assert result.ok is False
+    assert result.classification == "missing_api_key"
+    assert "FINANCIAL_DATASETS_API_KEY" in result.diagnosis
+
+
+def test_run_ticker_data_check_classifies_unauthorized_401(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("FINANCIAL_DATASETS_API_KEY", "bad-key")
+
+    def fake_get(url, headers, timeout):
+        response = Mock()
+        response.status_code = 401
+        response.text = "Unauthorized"
+        response.json.return_value = {"detail": "Unauthorized"}
+        return response
+
+    monkeypatch.setattr("src.data_diagnostics.requests.get", fake_get)
+    monkeypatch.setattr("src.data_diagnostics.requests.post", lambda url, headers, json, timeout: fake_get(url, headers, timeout))
+
+    result = run_ticker_data_check("BB", "2026-01-01", "2026-06-01")
+
+    assert result.ok is False
+    assert result.classification == "unauthorized_401"
+
+
+def test_run_ticker_data_check_classifies_connection_reset(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("FINANCIAL_DATASETS_API_KEY", "test-key")
+
+    def fake_get(url, headers, timeout):
+        raise requests.exceptions.ConnectionError("ConnectionResetError(10054, 'An existing connection was forcibly closed by the remote host')")
+
+    monkeypatch.setattr("src.data_diagnostics.requests.get", fake_get)
+    monkeypatch.setattr("src.data_diagnostics.requests.post", lambda url, headers, json, timeout: fake_get(url, headers, timeout))
+
+    result = run_ticker_data_check("BB", "2026-01-01", "2026-06-01")
+
+    assert result.ok is False
+    assert result.classification == "connection_reset"
+
+
+def test_basket_runner_data_check_only_writes_diagnostics(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "src.basket_runner.run_ticker_data_check",
+        lambda ticker, start_date, end_date: type(
+            "Check",
+            (),
+            {
+                "ticker": ticker,
+                "ok": ticker == "GME",
+                "classification": "missing_data" if ticker == "BB" else "ok",
+                "diagnosis": "ticker unsupported" if ticker == "BB" else "All good",
+                "env_var": "FINANCIAL_DATASETS_API_KEY",
+                "checked_at": "2026-06-13T00:00:00",
+                "checks": [],
+            },
+        )(),
+    )
+    monkeypatch.setattr(
+        "src.basket_runner.ticker_data_check_to_dict",
+        lambda result: {
+            "ticker": result.ticker,
+            "ok": result.ok,
+            "classification": result.classification,
+            "diagnosis": result.diagnosis,
+            "env_var": result.env_var,
+            "checked_at": result.checked_at,
+            "checks": result.checks,
+        },
+    )
+    monkeypatch.setattr("src.basket_runner.format_ticker_data_check", lambda result: json.dumps({"ticker": result.ticker}))
+
+    config = BasketRunConfig(
+        tickers=["BB", "GME"],
+        basket_name="speculative",
+        model="llama3.1:latest",
+        output_dir=str(tmp_path),
+        max_symbols=None,
+        continue_on_error=True,
+        show_reasoning=False,
+        start_date=None,
+        end_date=None,
+        dry_run=False,
+        data_check_only=True,
+        analysts=["fundamentals_analyst"],
+    )
+
+    run_dir = run_basket(config)
+    data_check = json.loads((run_dir / "data_check.json").read_text(encoding="utf-8"))
+    failures = json.loads((run_dir / "failures.json").read_text(encoding="utf-8"))
+    summary = (run_dir / "run_summary.md").read_text(encoding="utf-8")
+
+    assert len(data_check) == 2
+    assert failures[0]["classification"] == "missing_data"
+    assert "Data checks failed" in summary

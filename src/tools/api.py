@@ -4,6 +4,7 @@ import os
 import pandas as pd
 import requests
 import time
+from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +25,73 @@ from src.data.models import (
 
 # Global cache instance
 _cache = get_cache()
+
+FINANCIAL_DATASETS_API_KEY_ENV_VAR = "FINANCIAL_DATASETS_API_KEY"
+FINANCIAL_DATASETS_BASE_URL = "https://api.financialdatasets.ai"
+DEFAULT_REQUEST_TIMEOUT_SECONDS = 15
+
+
+@dataclass(frozen=True)
+class FinancialDatasetsRequestSpec:
+    name: str
+    method: str
+    url: str
+    json_data: dict | None = None
+
+
+def get_financial_datasets_api_key(api_key: str | None = None) -> str | None:
+    return api_key or os.environ.get(FINANCIAL_DATASETS_API_KEY_ENV_VAR)
+
+
+def build_financial_datasets_headers(api_key: str | None = None) -> dict[str, str]:
+    headers: dict[str, str] = {}
+    financial_api_key = get_financial_datasets_api_key(api_key)
+    if financial_api_key:
+        headers["X-API-KEY"] = financial_api_key
+    return headers
+
+
+def get_financial_datasets_request_specs(
+    ticker: str,
+    start_date: str,
+    end_date: str,
+    *,
+    financial_metrics_period: str = "ttm",
+    financial_metrics_limit: int = 5,
+    line_items: list[str] | None = None,
+    line_item_period: str = "ttm",
+    line_item_limit: int = 5,
+) -> list[FinancialDatasetsRequestSpec]:
+    requested_line_items = line_items or ["revenue", "net_income", "free_cash_flow", "outstanding_shares"]
+    return [
+        FinancialDatasetsRequestSpec(
+            name="prices",
+            method="GET",
+            url=f"{FINANCIAL_DATASETS_BASE_URL}/prices/?ticker={ticker}&interval=day&interval_multiplier=1&start_date={start_date}&end_date={end_date}",
+        ),
+        FinancialDatasetsRequestSpec(
+            name="financial_metrics",
+            method="GET",
+            url=f"{FINANCIAL_DATASETS_BASE_URL}/financial-metrics/?ticker={ticker}&report_period_lte={end_date}&limit={financial_metrics_limit}&period={financial_metrics_period}",
+        ),
+        FinancialDatasetsRequestSpec(
+            name="line_items",
+            method="POST",
+            url=f"{FINANCIAL_DATASETS_BASE_URL}/financials/search/line-items",
+            json_data={
+                "tickers": [ticker],
+                "line_items": requested_line_items,
+                "end_date": end_date,
+                "period": line_item_period,
+                "limit": line_item_limit,
+            },
+        ),
+        FinancialDatasetsRequestSpec(
+            name="company_facts",
+            method="GET",
+            url=f"{FINANCIAL_DATASETS_BASE_URL}/company/facts/?ticker={ticker}",
+        ),
+    ]
 
 
 def _make_api_request(url: str, headers: dict, method: str = "GET", json_data: dict = None, max_retries: int = 3) -> requests.Response:
@@ -70,12 +138,8 @@ def get_prices(ticker: str, start_date: str, end_date: str, api_key: str = None)
         return [Price(**price) for price in cached_data]
 
     # If not in cache, fetch from API
-    headers = {}
-    financial_api_key = api_key or os.environ.get("FINANCIAL_DATASETS_API_KEY")
-    if financial_api_key:
-        headers["X-API-KEY"] = financial_api_key
-
-    url = f"https://api.financialdatasets.ai/prices/?ticker={ticker}&interval=day&interval_multiplier=1&start_date={start_date}&end_date={end_date}"
+    headers = build_financial_datasets_headers(api_key)
+    url = f"{FINANCIAL_DATASETS_BASE_URL}/prices/?ticker={ticker}&interval=day&interval_multiplier=1&start_date={start_date}&end_date={end_date}"
     response = _make_api_request(url, headers)
     if response.status_code != 200:
         return []
@@ -112,12 +176,8 @@ def get_financial_metrics(
         return [FinancialMetrics(**metric) for metric in cached_data]
 
     # If not in cache, fetch from API
-    headers = {}
-    financial_api_key = api_key or os.environ.get("FINANCIAL_DATASETS_API_KEY")
-    if financial_api_key:
-        headers["X-API-KEY"] = financial_api_key
-
-    url = f"https://api.financialdatasets.ai/financial-metrics/?ticker={ticker}&report_period_lte={end_date}&limit={limit}&period={period}"
+    headers = build_financial_datasets_headers(api_key)
+    url = f"{FINANCIAL_DATASETS_BASE_URL}/financial-metrics/?ticker={ticker}&report_period_lte={end_date}&limit={limit}&period={period}"
     response = _make_api_request(url, headers)
     if response.status_code != 200:
         return []
@@ -148,12 +208,8 @@ def search_line_items(
 ) -> list[LineItem]:
     """Fetch line items from API."""
     # If not in cache or insufficient data, fetch from API
-    headers = {}
-    financial_api_key = api_key or os.environ.get("FINANCIAL_DATASETS_API_KEY")
-    if financial_api_key:
-        headers["X-API-KEY"] = financial_api_key
-
-    url = "https://api.financialdatasets.ai/financials/search/line-items"
+    headers = build_financial_datasets_headers(api_key)
+    url = f"{FINANCIAL_DATASETS_BASE_URL}/financials/search/line-items"
 
     body = {
         "tickers": [ticker],
@@ -196,16 +252,13 @@ def get_insider_trades(
         return [InsiderTrade(**trade) for trade in cached_data]
 
     # If not in cache, fetch from API
-    headers = {}
-    financial_api_key = api_key or os.environ.get("FINANCIAL_DATASETS_API_KEY")
-    if financial_api_key:
-        headers["X-API-KEY"] = financial_api_key
+    headers = build_financial_datasets_headers(api_key)
 
     all_trades = []
     current_end_date = end_date
 
     while True:
-        url = f"https://api.financialdatasets.ai/insider-trades/?ticker={ticker}&filing_date_lte={current_end_date}"
+        url = f"{FINANCIAL_DATASETS_BASE_URL}/insider-trades/?ticker={ticker}&filing_date_lte={current_end_date}"
         if start_date:
             url += f"&filing_date_gte={start_date}"
         url += f"&limit={limit}"
@@ -262,16 +315,13 @@ def get_company_news(
         return [CompanyNews(**news) for news in cached_data]
 
     # If not in cache, fetch from API
-    headers = {}
-    financial_api_key = api_key or os.environ.get("FINANCIAL_DATASETS_API_KEY")
-    if financial_api_key:
-        headers["X-API-KEY"] = financial_api_key
+    headers = build_financial_datasets_headers(api_key)
 
     all_news = []
     current_end_date = end_date
 
     while True:
-        url = f"https://api.financialdatasets.ai/news/?ticker={ticker}&end_date={current_end_date}"
+        url = f"{FINANCIAL_DATASETS_BASE_URL}/news/?ticker={ticker}&end_date={current_end_date}"
         if start_date:
             url += f"&start_date={start_date}"
         url += f"&limit={limit}"
@@ -321,12 +371,8 @@ def get_market_cap(
     # Check if end_date is today
     if end_date == datetime.datetime.now().strftime("%Y-%m-%d"):
         # Get the market cap from company facts API
-        headers = {}
-        financial_api_key = api_key or os.environ.get("FINANCIAL_DATASETS_API_KEY")
-        if financial_api_key:
-            headers["X-API-KEY"] = financial_api_key
-
-        url = f"https://api.financialdatasets.ai/company/facts/?ticker={ticker}"
+        headers = build_financial_datasets_headers(api_key)
+        url = f"{FINANCIAL_DATASETS_BASE_URL}/company/facts/?ticker={ticker}"
         response = _make_api_request(url, headers)
         if response.status_code != 200:
             print(f"Error fetching company facts: {ticker} - {response.status_code}")

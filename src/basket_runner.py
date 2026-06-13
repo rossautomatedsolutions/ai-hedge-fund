@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from src.cli.input import resolve_dates
+from src.data_diagnostics import format_ticker_data_check, run_ticker_data_check, ticker_data_check_to_dict
 from src.main import run_hedge_fund
 from src.utils.analysts import ANALYST_ORDER
 from src.utils.display import print_trading_output
@@ -113,6 +114,7 @@ class BasketRunConfig:
     start_date: str | None
     end_date: str | None
     dry_run: bool
+    data_check_only: bool
     analysts: list[str]
     model_provider: str = "Ollama"
 
@@ -121,22 +123,42 @@ def _write_json(path: Path, payload: Any) -> None:
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
 
 
-def _write_summary(path: Path, config: BasketRunConfig, successes: list[dict[str, Any]], failures: list[dict[str, Any]], run_dir: Path) -> None:
+def _write_summary(
+    path: Path,
+    config: BasketRunConfig,
+    successes: list[dict[str, Any]],
+    failures: list[dict[str, Any]],
+    run_dir: Path,
+    data_checks: list[dict[str, Any]] | None = None,
+) -> None:
+    data_checks = data_checks or []
+    data_check_failures = [check for check in data_checks if not check.get("ok")]
     lines = [
         "# RAS Ollama Basket Run",
         "",
         f"- Basket: `{config.basket_name}`",
         f"- Model: `{config.model}`",
         f"- Provider: `{config.model_provider}`",
+        f"- Mode: `{'data-check-only' if config.data_check_only else 'full-run'}`",
         f"- Tickers requested: `{', '.join(config.tickers)}`",
         f"- Successes: `{len(successes)}`",
         f"- Failures: `{len(failures)}`",
+        f"- Data checks passed: `{len(data_checks) - len(data_check_failures)}`",
+        f"- Data checks failed: `{len(data_check_failures)}`",
         f"- Output directory: `{run_dir.as_posix()}`",
     ]
+    if data_checks:
+        lines.extend(["", "## Data Check"])
+        for check in data_checks:
+            status = "ok" if check.get("ok") else check.get("classification", "unknown_error")
+            lines.append(f"- `{check['ticker']}`: {status} - {check.get('diagnosis', 'No diagnosis provided.')}")
     if failures:
         lines.extend(["", "## Failures"])
         for failure in failures:
-            lines.append(f"- `{failure['ticker']}`: {failure['error']}")
+            detail = failure.get("diagnosis") or failure.get("error") or "Unknown failure"
+            classification = failure.get("classification")
+            suffix = f" ({classification})" if classification else ""
+            lines.append(f"- `{failure['ticker']}`: {detail}{suffix}")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -160,9 +182,25 @@ def _write_decisions_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         writer.writerows(rows)
 
 
+def _classify_run_exception(exc: Exception) -> tuple[str, str]:
+    message = str(exc)
+    lowered = message.lower()
+    if "401" in message or "unauthorized" in lowered:
+        return ("unauthorized_401", "Run failed because the provider rejected the financial data request with HTTP 401. The key may be invalid or expired.")
+    if "ssl" in lowered:
+        return ("ssl_error", "Run failed because of an SSL/TLS error while contacting the financial data provider.")
+    if "10054" in message or "forcibly closed" in lowered or "connectionreseterror" in lowered:
+        return ("connection_reset", "Run failed because the remote host reset the financial data connection.")
+    if "timeout" in lowered or "timed out" in lowered:
+        return ("timeout", "Run failed because the financial data request timed out.")
+    return ("unknown_error", f"Run failed after passing data checks: {message}")
+
+
 def run_basket(config: BasketRunConfig) -> Path:
     run_dir = _build_run_dir(config.output_dir)
     start_date, end_date = resolve_dates(config.start_date, config.end_date, default_months_back=3)
+    logs_dir = run_dir / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
 
     manifest = {
         "created_at": datetime.now().isoformat(),
@@ -176,25 +214,63 @@ def run_basket(config: BasketRunConfig) -> Path:
         "start_date": start_date,
         "end_date": end_date,
         "dry_run": config.dry_run,
+        "data_check_only": config.data_check_only,
     }
     _write_json(run_dir / "run_manifest.json", manifest)
-
-    if config.dry_run:
-        _write_summary(run_dir / "run_summary.md", config, [], [], run_dir)
-        return run_dir
-
-    if not ensure_ollama_and_model(config.model, interactive=False):
-        raise RuntimeError(f"Ollama model '{config.model}' is not available locally.")
-
-    logs_dir = run_dir / "logs"
-    logs_dir.mkdir(parents=True, exist_ok=True)
 
     combined_logs: list[str] = []
     successes: list[dict[str, Any]] = []
     failures: list[dict[str, Any]] = []
     decision_rows: list[dict[str, Any]] = []
+    data_checks: list[dict[str, Any]] = []
+
+    if config.dry_run:
+        _write_json(run_dir / "failures.json", failures)
+        _write_json(run_dir / "data_check.json", data_checks)
+        (run_dir / "raw_console_output.txt").write_text("", encoding="utf-8")
+        _write_summary(run_dir / "run_summary.md", config, successes, failures, run_dir, data_checks)
+        return run_dir
+
+    if not config.data_check_only and not ensure_ollama_and_model(config.model, interactive=False):
+        raise RuntimeError(f"Ollama model '{config.model}' is not available locally.")
 
     for ticker in config.tickers:
+        data_check_result = run_ticker_data_check(ticker, start_date, end_date)
+        data_check_payload = ticker_data_check_to_dict(data_check_result)
+        data_checks.append(data_check_payload)
+        (logs_dir / f"{ticker}.data_check.log").write_text(format_ticker_data_check(data_check_result) + "\n", encoding="utf-8")
+
+        if config.data_check_only:
+            (logs_dir / f"{ticker}.log").write_text(format_ticker_data_check(data_check_result) + "\n", encoding="utf-8")
+            if data_check_result.ok:
+                successes.append({"ticker": ticker, "mode": "data-check-only"})
+            else:
+                failures.append(
+                    {
+                        "ticker": ticker,
+                        "classification": data_check_result.classification,
+                        "diagnosis": data_check_result.diagnosis,
+                        "error": data_check_result.diagnosis,
+                    }
+                )
+            continue
+
+        if not data_check_result.ok:
+            message = f"Data check failed before LLM run: {data_check_result.diagnosis}"
+            combined_logs.append(f"===== {ticker} =====\n{format_ticker_data_check(data_check_result)}\nERROR: {message}\n")
+            (logs_dir / f"{ticker}.log").write_text(f"{format_ticker_data_check(data_check_result)}\nERROR: {message}\n", encoding="utf-8")
+            failures.append(
+                {
+                    "ticker": ticker,
+                    "classification": data_check_result.classification,
+                    "diagnosis": data_check_result.diagnosis,
+                    "error": message,
+                }
+            )
+            if not config.continue_on_error:
+                break
+            continue
+
         buffer = io.StringIO()
         try:
             with redirect_stdout(buffer):
@@ -210,22 +286,33 @@ def run_basket(config: BasketRunConfig) -> Path:
                 )
                 print_trading_output(result)
             log_output = buffer.getvalue()
-            combined_logs.append(f"===== {ticker} =====\n{log_output}")
-            (logs_dir / f"{ticker}.log").write_text(log_output, encoding="utf-8")
+            full_log_output = f"{format_ticker_data_check(data_check_result)}\n\n{log_output}"
+            combined_logs.append(f"===== {ticker} =====\n{full_log_output}")
+            (logs_dir / f"{ticker}.log").write_text(full_log_output, encoding="utf-8")
             successes.append({"ticker": ticker})
             decision_rows.append(_flatten_decision(ticker, result))
         except Exception as exc:
             log_output = buffer.getvalue()
-            combined_logs.append(f"===== {ticker} =====\n{log_output}\nERROR: {exc}\n")
-            (logs_dir / f"{ticker}.log").write_text(f"{log_output}\nERROR: {exc}\n", encoding="utf-8")
-            failures.append({"ticker": ticker, "error": str(exc)})
+            full_log_output = f"{format_ticker_data_check(data_check_result)}\n\n{log_output}\nERROR: {exc}\n"
+            combined_logs.append(f"===== {ticker} =====\n{full_log_output}")
+            (logs_dir / f"{ticker}.log").write_text(full_log_output, encoding="utf-8")
+            classification, diagnosis = _classify_run_exception(exc)
+            failures.append(
+                {
+                    "ticker": ticker,
+                    "classification": classification,
+                    "diagnosis": diagnosis,
+                    "error": str(exc),
+                }
+            )
             if not config.continue_on_error:
                 break
 
     (run_dir / "raw_console_output.txt").write_text("\n".join(combined_logs), encoding="utf-8")
     _write_json(run_dir / "failures.json", failures)
+    _write_json(run_dir / "data_check.json", data_checks)
     _write_decisions_csv(run_dir / "combined_decisions.csv", decision_rows)
-    _write_summary(run_dir / "run_summary.md", config, successes, failures, run_dir)
+    _write_summary(run_dir / "run_summary.md", config, successes, failures, run_dir, data_checks)
     return run_dir
 
 
@@ -241,6 +328,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--start-date", type=str)
     parser.add_argument("--end-date", type=str)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--data-check-only", action="store_true", help="Check data reachability per ticker without calling any LLM")
     return parser
 
 
@@ -263,11 +351,12 @@ def main() -> int:
         start_date=args.start_date,
         end_date=args.end_date,
         dry_run=args.dry_run,
+        data_check_only=args.data_check_only,
         analysts=analysts,
     )
 
     run_dir = run_basket(config)
-    print(json.dumps({"run_dir": run_dir.as_posix(), "dry_run": config.dry_run}, indent=2))
+    print(json.dumps({"run_dir": run_dir.as_posix(), "dry_run": config.dry_run, "data_check_only": config.data_check_only}, indent=2))
     return 0
 
 
