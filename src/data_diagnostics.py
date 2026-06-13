@@ -19,11 +19,13 @@ from src.tools.api import (
 
 FAILURE_TYPES = {
     "missing_api_key",
+    "invalid_api_key",
     "unauthorized_401",
     "ssl_error",
     "connection_reset",
     "timeout",
     "missing_data",
+    "partial_data",
     "unknown_error",
 }
 
@@ -45,6 +47,7 @@ class EndpointCheckResult:
 class TickerDataCheckResult:
     ticker: str
     ok: bool
+    partial_ok: bool
     classification: str
     diagnosis: str
     env_var: str
@@ -73,6 +76,19 @@ def _extract_record_count(spec: FinancialDatasetsRequestSpec, response: requests
     return None
 
 
+def _extract_error_text(response: requests.Response) -> str:
+    payload = _safe_json(response)
+    text_parts: list[str] = []
+    for key in ("message", "error", "detail"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            text_parts.append(value.strip())
+    raw_text = (response.text or "").strip()
+    if raw_text:
+        text_parts.append(raw_text)
+    return " | ".join(text_parts)
+
+
 def _classify_response(
     spec: FinancialDatasetsRequestSpec,
     response: requests.Response,
@@ -80,16 +96,34 @@ def _classify_response(
     has_api_key: bool,
 ) -> tuple[str, str, int | None]:
     status_code = response.status_code
-    if not has_api_key:
-        return (
-            "missing_api_key",
-            f"`{FINANCIAL_DATASETS_API_KEY_ENV_VAR}` is not set, so {spec.name} cannot be authenticated.",
-            None,
-        )
+    if status_code == 200:
+        record_count = _extract_record_count(spec, response)
+        if record_count == 0:
+            return (
+                "missing_data",
+                f"{spec.name} responded successfully but returned no records. The ticker may be unsupported or data may be unavailable.",
+                record_count,
+            )
+        return ("ok", f"{spec.name} returned usable data.", record_count)
+
     if status_code == 401:
+        error_text = _extract_error_text(response)
+        lowered = error_text.lower()
+        if "missing api key" in lowered and not has_api_key:
+            return (
+                "missing_api_key",
+                f"`{FINANCIAL_DATASETS_API_KEY_ENV_VAR}` is not set, so {spec.name} cannot be authenticated.",
+                None,
+            )
+        if has_api_key:
+            return (
+                "unauthorized_401",
+                f"{spec.name} returned HTTP 401 with an API key present. The key may be invalid, expired, or unauthorized for this endpoint.",
+                None,
+            )
         return (
-            "unauthorized_401",
-            f"{spec.name} returned HTTP 401. The API key is missing, invalid, expired, or not accepted for this endpoint.",
+            "invalid_api_key",
+            f"{spec.name} returned HTTP 401 without a usable public response. This likely requires a valid `{FINANCIAL_DATASETS_API_KEY_ENV_VAR}`.",
             None,
         )
     if status_code in {402, 403, 429}:
@@ -110,24 +144,10 @@ def _classify_response(
             f"{spec.name} returned HTTP {status_code}. Response body may contain more detail.",
             None,
         )
-
-    record_count = _extract_record_count(spec, response)
-    if record_count == 0:
-        return (
-            "missing_data",
-            f"{spec.name} responded successfully but returned no records. The ticker may be unsupported or data may be unavailable.",
-            record_count,
-        )
-
-    return ("ok", f"{spec.name} returned usable data.", record_count)
+    return ("unknown_error", f"{spec.name} returned an unexpected HTTP status: {status_code}.", None)
 
 
 def _classify_exception(spec: FinancialDatasetsRequestSpec, exc: Exception, *, has_api_key: bool) -> tuple[str, str]:
-    if not has_api_key:
-        return (
-            "missing_api_key",
-            f"`{FINANCIAL_DATASETS_API_KEY_ENV_VAR}` is not set, so {spec.name} cannot be authenticated.",
-        )
     if isinstance(exc, requests.exceptions.SSLError):
         return ("ssl_error", f"{spec.name} failed with an SSL/TLS error while contacting the provider.")
     if isinstance(exc, (requests.exceptions.ConnectTimeout, requests.exceptions.ReadTimeout, requests.exceptions.Timeout)):
@@ -178,19 +198,41 @@ def _run_request_check(spec: FinancialDatasetsRequestSpec, *, api_key: str | Non
 def run_ticker_data_check(ticker: str, start_date: str, end_date: str, *, api_key: str | None = None) -> TickerDataCheckResult:
     specs = get_financial_datasets_request_specs(ticker, start_date, end_date)
     checks = [_run_request_check(spec, api_key=api_key) for spec in specs]
+    successes = [check for check in checks if check.ok]
     failures = [check for check in checks if not check.ok]
 
-    if not failures:
+    if successes and not failures:
+        ok = True
+        partial_ok = False
         classification = "ok"
         diagnosis = "All required price/fundamental/financial data checks succeeded."
+    elif successes and failures:
+        ok = False
+        partial_ok = True
+        classification = "partial_data"
+        diagnosis = "Some required data endpoints succeeded while others failed. Review per-endpoint results for coverage gaps."
     else:
-        primary = failures[0]
-        classification = primary.classification
-        diagnosis = primary.diagnosis
+        ok = False
+        partial_ok = False
+        failure_kinds = {check.classification for check in failures}
+        if failure_kinds == {"missing_api_key"}:
+            classification = "missing_api_key"
+            diagnosis = f"All required endpoints failed because `{FINANCIAL_DATASETS_API_KEY_ENV_VAR}` is not set."
+        elif failure_kinds <= {"unauthorized_401", "invalid_api_key"}:
+            classification = "unauthorized_401"
+            diagnosis = "All required endpoints returned HTTP 401 with authentication failures."
+        elif failure_kinds == {"missing_data"}:
+            classification = "missing_data"
+            diagnosis = "All required endpoints responded without usable records for this ticker."
+        else:
+            primary = failures[0]
+            classification = primary.classification
+            diagnosis = primary.diagnosis
 
     return TickerDataCheckResult(
         ticker=ticker,
-        ok=not failures,
+        ok=ok,
+        partial_ok=partial_ok,
         classification=classification,
         diagnosis=diagnosis,
         env_var=FINANCIAL_DATASETS_API_KEY_ENV_VAR,

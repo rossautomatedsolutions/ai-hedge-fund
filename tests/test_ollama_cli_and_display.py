@@ -192,8 +192,8 @@ def test_run_ticker_data_check_classifies_missing_api_key(monkeypatch: pytest.Mo
     def fake_get(url, headers, timeout):
         response = Mock()
         response.status_code = 401
-        response.text = "Unauthorized"
-        response.json.return_value = {"detail": "Unauthorized"}
+        response.text = '{"error":"Missing API key","message":"Please include an X-API-KEY"}'
+        response.json.return_value = {"error": "Missing API key", "message": "Please include an X-API-KEY"}
         return response
 
     monkeypatch.setattr("src.data_diagnostics.requests.get", fake_get)
@@ -204,6 +204,40 @@ def test_run_ticker_data_check_classifies_missing_api_key(monkeypatch: pytest.Mo
     assert result.ok is False
     assert result.classification == "missing_api_key"
     assert "FINANCIAL_DATASETS_API_KEY" in result.diagnosis
+
+
+def test_run_ticker_data_check_accepts_public_http_200_without_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("FINANCIAL_DATASETS_API_KEY", raising=False)
+
+    def fake_get(url, headers, timeout):
+        response = Mock()
+        response.status_code = 200
+        response.text = "ok"
+        if "prices" in url:
+            response.json.return_value = {"prices": [{"time": "2026-01-01T00:00:00Z"}]}
+        elif "financial-metrics" in url:
+            response.json.return_value = {"financial_metrics": [{"market_cap": 1}]}
+        elif "company/facts" in url:
+            response.json.return_value = {"company_facts": {"market_cap": 1}}
+        else:
+            response.json.return_value = {}
+        return response
+
+    def fake_post(url, headers, json, timeout):
+        response = Mock()
+        response.status_code = 200
+        response.text = "ok"
+        response.json.return_value = {"search_results": [{"ticker": "AAPL"}]}
+        return response
+
+    monkeypatch.setattr("src.data_diagnostics.requests.get", fake_get)
+    monkeypatch.setattr("src.data_diagnostics.requests.post", fake_post)
+
+    result = run_ticker_data_check("AAPL", "2026-01-01", "2026-06-01")
+
+    assert result.ok is True
+    assert result.partial_ok is False
+    assert result.classification == "ok"
 
 
 def test_run_ticker_data_check_classifies_unauthorized_401(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -223,6 +257,80 @@ def test_run_ticker_data_check_classifies_unauthorized_401(monkeypatch: pytest.M
 
     assert result.ok is False
     assert result.classification == "unauthorized_401"
+
+
+def test_run_ticker_data_check_classifies_partial_data(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("FINANCIAL_DATASETS_API_KEY", raising=False)
+
+    def fake_get(url, headers, timeout):
+        response = Mock()
+        if "prices" in url:
+            response.status_code = 200
+            response.text = "ok"
+            response.json.return_value = {"prices": [{"time": "2026-01-01T00:00:00Z"}]}
+        elif "financial-metrics" in url:
+            response.status_code = 401
+            response.text = '{"error":"Missing API key","message":"Please include an X-API-KEY"}'
+            response.json.return_value = {"error": "Missing API key", "message": "Please include an X-API-KEY"}
+        elif "company/facts" in url:
+            response.status_code = 401
+            response.text = '{"error":"Missing API key","message":"Please include an X-API-KEY"}'
+            response.json.return_value = {"error": "Missing API key", "message": "Please include an X-API-KEY"}
+        else:
+            response.status_code = 200
+            response.text = "ok"
+            response.json.return_value = {}
+        return response
+
+    def fake_post(url, headers, json, timeout):
+        response = Mock()
+        response.status_code = 200
+        response.text = "ok"
+        response.json.return_value = {"search_results": [{"ticker": "GOOGL"}]}
+        return response
+
+    monkeypatch.setattr("src.data_diagnostics.requests.get", fake_get)
+    monkeypatch.setattr("src.data_diagnostics.requests.post", fake_post)
+
+    result = run_ticker_data_check("GOOGL", "2026-01-01", "2026-06-01")
+
+    assert result.ok is False
+    assert result.partial_ok is True
+    assert result.classification == "partial_data"
+
+
+def test_run_ticker_data_check_classifies_empty_success_payload_as_missing_data(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("FINANCIAL_DATASETS_API_KEY", raising=False)
+
+    def fake_get(url, headers, timeout):
+        response = Mock()
+        response.status_code = 200
+        response.text = "ok"
+        if "prices" in url:
+            response.json.return_value = {"prices": []}
+        elif "financial-metrics" in url:
+            response.json.return_value = {"financial_metrics": []}
+        elif "company/facts" in url:
+            response.json.return_value = {"company_facts": None}
+        else:
+            response.json.return_value = {}
+        return response
+
+    def fake_post(url, headers, json, timeout):
+        response = Mock()
+        response.status_code = 200
+        response.text = "ok"
+        response.json.return_value = {"search_results": []}
+        return response
+
+    monkeypatch.setattr("src.data_diagnostics.requests.get", fake_get)
+    monkeypatch.setattr("src.data_diagnostics.requests.post", fake_post)
+
+    result = run_ticker_data_check("ZZZZ", "2026-01-01", "2026-06-01")
+
+    assert result.ok is False
+    assert result.partial_ok is False
+    assert result.classification == "missing_data"
 
 
 def test_run_ticker_data_check_classifies_connection_reset(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -249,6 +357,7 @@ def test_basket_runner_data_check_only_writes_diagnostics(tmp_path: Path, monkey
             {
                 "ticker": ticker,
                 "ok": ticker == "GME",
+                "partial_ok": False,
                 "classification": "missing_data" if ticker == "BB" else "ok",
                 "diagnosis": "ticker unsupported" if ticker == "BB" else "All good",
                 "env_var": "FINANCIAL_DATASETS_API_KEY",
@@ -262,6 +371,7 @@ def test_basket_runner_data_check_only_writes_diagnostics(tmp_path: Path, monkey
         lambda result: {
             "ticker": result.ticker,
             "ok": result.ok,
+            "partial_ok": result.partial_ok,
             "classification": result.classification,
             "diagnosis": result.diagnosis,
             "env_var": result.env_var,

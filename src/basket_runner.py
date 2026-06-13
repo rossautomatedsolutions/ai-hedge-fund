@@ -150,7 +150,12 @@ def _write_summary(
     if data_checks:
         lines.extend(["", "## Data Check"])
         for check in data_checks:
-            status = "ok" if check.get("ok") else check.get("classification", "unknown_error")
+            if check.get("ok"):
+                status = "passed"
+            elif check.get("classification") == "partial_data":
+                status = "partial_data"
+            else:
+                status = check.get("classification", "unknown_error")
             lines.append(f"- `{check['ticker']}`: {status} - {check.get('diagnosis', 'No diagnosis provided.')}")
     if failures:
         lines.extend(["", "## Failures"])
