@@ -7,7 +7,7 @@ from unittest.mock import Mock
 import pytest
 import requests
 
-from src.basket_runner import BasketRunConfig, run_basket
+from src.basket_runner import BasketRunConfig, resolve_analysts_for_preset, resolve_data_request_options, run_basket
 from src.cli.input import resolve_model_selection, select_model
 from src.data_diagnostics import run_ticker_data_check
 from src.utils.display import print_trading_output
@@ -86,7 +86,11 @@ def test_basket_runner_dry_run_writes_manifest_and_summary(tmp_path: Path) -> No
         end_date=None,
         dry_run=True,
         data_check_only=False,
+        analyst_preset="core",
         analysts=["fundamentals_analyst", "technical_analyst", "valuation_analyst"],
+        request_timeout_seconds=15,
+        max_data_retries=3,
+        fast_data_mode=False,
     )
 
     run_dir = run_basket(config)
@@ -170,7 +174,11 @@ def test_basket_runner_continue_on_error_writes_failures(tmp_path: Path, monkeyp
         end_date=None,
         dry_run=False,
         data_check_only=False,
+        analyst_preset="all",
         analysts=["fundamentals_analyst"],
+        request_timeout_seconds=15,
+        max_data_retries=3,
+        fast_data_mode=False,
     )
 
     run_dir = run_basket(config)
@@ -383,7 +391,11 @@ def test_basket_runner_data_check_only_writes_diagnostics(tmp_path: Path, monkey
         end_date=None,
         dry_run=False,
         data_check_only=True,
+        analyst_preset="all",
         analysts=["fundamentals_analyst"],
+        request_timeout_seconds=15,
+        max_data_retries=3,
+        fast_data_mode=False,
     )
 
     run_dir = run_basket(config)
@@ -394,3 +406,98 @@ def test_basket_runner_data_check_only_writes_diagnostics(tmp_path: Path, monkey
     assert len(data_check) == 2
     assert failures[0]["classification"] == "missing_data"
     assert "Data checks failed" in summary
+
+
+def test_resolve_analysts_for_preset_core() -> None:
+    assert resolve_analysts_for_preset("core") == [
+        "fundamentals_analyst",
+        "technical_analyst",
+        "valuation_analyst",
+    ]
+
+
+def test_resolve_analysts_for_preset_no_news_excludes_news_analysts() -> None:
+    analysts = resolve_analysts_for_preset("no-news")
+    assert "news_sentiment_analyst" not in analysts
+    assert "sentiment_analyst" not in analysts
+    assert "technical_analyst" in analysts
+
+
+def test_resolve_data_request_options_fast_mode() -> None:
+    options = resolve_data_request_options(
+        request_timeout_seconds=15,
+        max_data_retries=3,
+        fast_data_mode=True,
+    )
+    assert options == {
+        "request_timeout_seconds": 5,
+        "max_data_retries": 1,
+        "skip_optional_slow_data": True,
+    }
+
+
+def test_basket_runner_applies_request_settings(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    observed: list[tuple[int | None, int | None, bool | None]] = []
+
+    class DummyContext:
+        def __enter__(self):
+            return None
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    def fake_settings(*, timeout_seconds=None, max_attempts=None, skip_optional_slow_data=None):
+        observed.append((timeout_seconds, max_attempts, skip_optional_slow_data))
+        return DummyContext()
+
+    monkeypatch.setattr("src.basket_runner.financial_data_request_settings", fake_settings)
+    monkeypatch.setattr("src.basket_runner.ensure_ollama_and_model", lambda model, interactive=False: True)
+    monkeypatch.setattr("src.basket_runner.run_ticker_data_check", lambda ticker, start_date, end_date: type("Check", (), {
+        "ticker": ticker,
+        "ok": False,
+        "partial_ok": False,
+        "classification": "missing_data",
+        "diagnosis": "none",
+        "env_var": "FINANCIAL_DATASETS_API_KEY",
+        "checked_at": "2026-06-13T00:00:00",
+        "checks": [],
+    })())
+    monkeypatch.setattr("src.basket_runner.ticker_data_check_to_dict", lambda result: {
+        "ticker": result.ticker,
+        "ok": result.ok,
+        "partial_ok": result.partial_ok,
+        "classification": result.classification,
+        "diagnosis": result.diagnosis,
+        "env_var": result.env_var,
+        "checked_at": result.checked_at,
+        "checks": result.checks,
+    })
+    monkeypatch.setattr("src.basket_runner.format_ticker_data_check", lambda result: "{}")
+    monkeypatch.setattr("src.basket_runner.get_financial_data_request_settings", lambda: type("Settings", (), {
+        "timeout_seconds": 5,
+        "max_attempts": 2,
+        "skip_optional_slow_data": True,
+    })())
+
+    config = BasketRunConfig(
+        tickers=["AAPL"],
+        basket_name="large-cap",
+        model="llama3.1:latest",
+        output_dir=str(tmp_path),
+        max_symbols=None,
+        continue_on_error=True,
+        show_reasoning=False,
+        start_date=None,
+        end_date=None,
+        dry_run=False,
+        data_check_only=True,
+        analyst_preset="core",
+        analysts=["fundamentals_analyst", "technical_analyst", "valuation_analyst"],
+        request_timeout_seconds=15,
+        max_data_retries=3,
+        fast_data_mode=True,
+    )
+
+    run_basket(config)
+
+    assert observed == [(5, 2, True)]

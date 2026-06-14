@@ -16,6 +16,7 @@ from src.main import run_hedge_fund
 from src.utils.analysts import ANALYST_ORDER
 from src.utils.display import print_trading_output
 from src.utils.ollama import ensure_ollama_and_model
+from src.tools.api import financial_data_request_settings, get_financial_data_request_settings
 
 
 BASKETS = {
@@ -51,6 +52,14 @@ BASKETS = {
         "XLC",
     ],
 }
+
+ANALYST_PRESETS = {
+    "all": None,
+    "core": ["fundamentals_analyst", "technical_analyst", "valuation_analyst"],
+    "no-news": None,
+    "technical-only": ["technical_analyst"],
+}
+NEWS_DISABLED_ANALYSTS = {"sentiment_analyst", "news_sentiment_analyst"}
 
 
 def _parse_tickers(raw_tickers: str | None) -> list[str]:
@@ -115,8 +124,44 @@ class BasketRunConfig:
     end_date: str | None
     dry_run: bool
     data_check_only: bool
+    analyst_preset: str
     analysts: list[str]
+    request_timeout_seconds: int
+    max_data_retries: int
+    fast_data_mode: bool
     model_provider: str = "Ollama"
+
+
+def resolve_analysts_for_preset(preset: str) -> list[str]:
+    all_analysts = [analyst_key for _, analyst_key in ANALYST_ORDER]
+    if preset == "all":
+        return all_analysts
+    if preset == "core":
+        return list(ANALYST_PRESETS["core"] or [])
+    if preset == "no-news":
+        return [analyst for analyst in all_analysts if analyst not in NEWS_DISABLED_ANALYSTS]
+    if preset == "technical-only":
+        return list(ANALYST_PRESETS["technical-only"] or [])
+    raise ValueError(f"Unknown analyst preset: {preset}")
+
+
+def resolve_data_request_options(
+    *,
+    request_timeout_seconds: int,
+    max_data_retries: int,
+    fast_data_mode: bool,
+) -> dict[str, Any]:
+    if fast_data_mode:
+        return {
+            "request_timeout_seconds": min(request_timeout_seconds, 5),
+            "max_data_retries": min(max_data_retries, 1),
+            "skip_optional_slow_data": True,
+        }
+    return {
+        "request_timeout_seconds": request_timeout_seconds,
+        "max_data_retries": max_data_retries,
+        "skip_optional_slow_data": False,
+    }
 
 
 def _write_json(path: Path, payload: Any) -> None:
@@ -133,6 +178,11 @@ def _write_summary(
 ) -> None:
     data_checks = data_checks or []
     data_check_failures = [check for check in data_checks if not check.get("ok")]
+    effective_request_options = resolve_data_request_options(
+        request_timeout_seconds=config.request_timeout_seconds,
+        max_data_retries=config.max_data_retries,
+        fast_data_mode=config.fast_data_mode,
+    )
     lines = [
         "# RAS Ollama Basket Run",
         "",
@@ -140,6 +190,11 @@ def _write_summary(
         f"- Model: `{config.model}`",
         f"- Provider: `{config.model_provider}`",
         f"- Mode: `{'data-check-only' if config.data_check_only else 'full-run'}`",
+        f"- Analyst preset: `{config.analyst_preset}`",
+        f"- Analysts: `{', '.join(config.analysts)}`",
+        f"- Request timeout seconds: `{effective_request_options['request_timeout_seconds']}`",
+        f"- Max data retries: `{effective_request_options['max_data_retries']}`",
+        f"- Fast data mode: `{config.fast_data_mode}`",
         f"- Tickers requested: `{', '.join(config.tickers)}`",
         f"- Successes: `{len(successes)}`",
         f"- Failures: `{len(failures)}`",
@@ -206,6 +261,11 @@ def run_basket(config: BasketRunConfig) -> Path:
     start_date, end_date = resolve_dates(config.start_date, config.end_date, default_months_back=3)
     logs_dir = run_dir / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
+    request_options = resolve_data_request_options(
+        request_timeout_seconds=config.request_timeout_seconds,
+        max_data_retries=config.max_data_retries,
+        fast_data_mode=config.fast_data_mode,
+    )
 
     manifest = {
         "created_at": datetime.now().isoformat(),
@@ -220,6 +280,11 @@ def run_basket(config: BasketRunConfig) -> Path:
         "end_date": end_date,
         "dry_run": config.dry_run,
         "data_check_only": config.data_check_only,
+        "analyst_preset": config.analyst_preset,
+        "request_timeout_seconds": request_options["request_timeout_seconds"],
+        "max_data_retries": request_options["max_data_retries"],
+        "fast_data_mode": config.fast_data_mode,
+        "skip_optional_slow_data": request_options["skip_optional_slow_data"],
     }
     _write_json(run_dir / "run_manifest.json", manifest)
 
@@ -239,85 +304,119 @@ def run_basket(config: BasketRunConfig) -> Path:
     if not config.data_check_only and not ensure_ollama_and_model(config.model, interactive=False):
         raise RuntimeError(f"Ollama model '{config.model}' is not available locally.")
 
-    for ticker in config.tickers:
-        data_check_result = run_ticker_data_check(ticker, start_date, end_date)
-        data_check_payload = ticker_data_check_to_dict(data_check_result)
-        data_checks.append(data_check_payload)
-        (logs_dir / f"{ticker}.data_check.log").write_text(format_ticker_data_check(data_check_result) + "\n", encoding="utf-8")
+    print(
+        f"Writing basket logs to {logs_dir.as_posix()} | "
+        f"timeout={request_options['request_timeout_seconds']}s | "
+        f"max_data_retries={request_options['max_data_retries']} | "
+        f"fast_data_mode={config.fast_data_mode}"
+    )
 
-        if config.data_check_only:
-            (logs_dir / f"{ticker}.log").write_text(format_ticker_data_check(data_check_result) + "\n", encoding="utf-8")
-            if data_check_result.ok:
-                successes.append({"ticker": ticker, "mode": "data-check-only"})
-            else:
-                failures.append(
-                    {
-                        "ticker": ticker,
-                        "classification": data_check_result.classification,
-                        "diagnosis": data_check_result.diagnosis,
-                        "error": data_check_result.diagnosis,
-                    }
+    try:
+        with financial_data_request_settings(
+            timeout_seconds=request_options["request_timeout_seconds"],
+            max_attempts=request_options["max_data_retries"] + 1,
+            skip_optional_slow_data=request_options["skip_optional_slow_data"],
+        ):
+            active_settings = get_financial_data_request_settings()
+            for ticker in config.tickers:
+                print(f"[ticker:{ticker}] starting data check | log={logs_dir / f'{ticker}.data_check.log'}")
+                data_check_result = run_ticker_data_check(ticker, start_date, end_date)
+                data_check_payload = ticker_data_check_to_dict(data_check_result)
+                data_checks.append(data_check_payload)
+                (logs_dir / f"{ticker}.data_check.log").write_text(format_ticker_data_check(data_check_result) + "\n", encoding="utf-8")
+
+                if config.data_check_only:
+                    print(f"[ticker:{ticker}] data-check-only complete with classification={data_check_result.classification}")
+                    (logs_dir / f"{ticker}.log").write_text(format_ticker_data_check(data_check_result) + "\n", encoding="utf-8")
+                    if data_check_result.ok:
+                        successes.append({"ticker": ticker, "mode": "data-check-only"})
+                    else:
+                        failures.append(
+                            {
+                                "ticker": ticker,
+                                "classification": data_check_result.classification,
+                                "diagnosis": data_check_result.diagnosis,
+                                "error": data_check_result.diagnosis,
+                            }
+                        )
+                    continue
+
+                if not data_check_result.ok:
+                    message = f"Data check failed before LLM run: {data_check_result.diagnosis}"
+                    print(f"[ticker:{ticker}] stopping before live run: {message}")
+                    combined_logs.append(f"===== {ticker} =====\n{format_ticker_data_check(data_check_result)}\nERROR: {message}\n")
+                    (logs_dir / f"{ticker}.log").write_text(f"{format_ticker_data_check(data_check_result)}\nERROR: {message}\n", encoding="utf-8")
+                    failures.append(
+                        {
+                            "ticker": ticker,
+                            "classification": data_check_result.classification,
+                            "diagnosis": data_check_result.diagnosis,
+                            "error": message,
+                        }
+                    )
+                    if not config.continue_on_error:
+                        break
+                    continue
+
+                print(
+                    f"[ticker:{ticker}] starting live run | analysts={','.join(config.analysts)} | "
+                    f"timeout={active_settings.timeout_seconds}s | attempts={active_settings.max_attempts} | "
+                    f"skip_optional_slow_data={active_settings.skip_optional_slow_data}"
                 )
-            continue
-
-        if not data_check_result.ok:
-            message = f"Data check failed before LLM run: {data_check_result.diagnosis}"
-            combined_logs.append(f"===== {ticker} =====\n{format_ticker_data_check(data_check_result)}\nERROR: {message}\n")
-            (logs_dir / f"{ticker}.log").write_text(f"{format_ticker_data_check(data_check_result)}\nERROR: {message}\n", encoding="utf-8")
-            failures.append(
-                {
-                    "ticker": ticker,
-                    "classification": data_check_result.classification,
-                    "diagnosis": data_check_result.diagnosis,
-                    "error": message,
-                }
-            )
-            if not config.continue_on_error:
-                break
-            continue
-
-        buffer = io.StringIO()
-        try:
-            with redirect_stdout(buffer):
-                result = run_hedge_fund(
-                    tickers=[ticker],
-                    start_date=start_date,
-                    end_date=end_date,
-                    portfolio=_portfolio_for_ticker(ticker),
-                    show_reasoning=config.show_reasoning,
-                    selected_analysts=config.analysts,
-                    model_name=config.model,
-                    model_provider=config.model_provider,
-                )
-                print_trading_output(result)
-            log_output = buffer.getvalue()
-            full_log_output = f"{format_ticker_data_check(data_check_result)}\n\n{log_output}"
-            combined_logs.append(f"===== {ticker} =====\n{full_log_output}")
-            (logs_dir / f"{ticker}.log").write_text(full_log_output, encoding="utf-8")
-            successes.append({"ticker": ticker})
-            decision_rows.append(_flatten_decision(ticker, result))
-        except Exception as exc:
-            log_output = buffer.getvalue()
-            full_log_output = f"{format_ticker_data_check(data_check_result)}\n\n{log_output}\nERROR: {exc}\n"
-            combined_logs.append(f"===== {ticker} =====\n{full_log_output}")
-            (logs_dir / f"{ticker}.log").write_text(full_log_output, encoding="utf-8")
-            classification, diagnosis = _classify_run_exception(exc)
-            failures.append(
-                {
-                    "ticker": ticker,
-                    "classification": classification,
-                    "diagnosis": diagnosis,
-                    "error": str(exc),
-                }
-            )
-            if not config.continue_on_error:
-                break
-
-    (run_dir / "raw_console_output.txt").write_text("\n".join(combined_logs), encoding="utf-8")
-    _write_json(run_dir / "failures.json", failures)
-    _write_json(run_dir / "data_check.json", data_checks)
-    _write_decisions_csv(run_dir / "combined_decisions.csv", decision_rows)
-    _write_summary(run_dir / "run_summary.md", config, successes, failures, run_dir, data_checks)
+                buffer = io.StringIO()
+                try:
+                    with redirect_stdout(buffer):
+                        result = run_hedge_fund(
+                            tickers=[ticker],
+                            start_date=start_date,
+                            end_date=end_date,
+                            portfolio=_portfolio_for_ticker(ticker),
+                            show_reasoning=config.show_reasoning,
+                            selected_analysts=config.analysts,
+                            model_name=config.model,
+                            model_provider=config.model_provider,
+                        )
+                        print_trading_output(result)
+                    log_output = buffer.getvalue()
+                    full_log_output = f"{format_ticker_data_check(data_check_result)}\n\n{log_output}"
+                    combined_logs.append(f"===== {ticker} =====\n{full_log_output}")
+                    (logs_dir / f"{ticker}.log").write_text(full_log_output, encoding="utf-8")
+                    print(f"[ticker:{ticker}] completed successfully | log={logs_dir / f'{ticker}.log'}")
+                    successes.append({"ticker": ticker})
+                    decision_rows.append(_flatten_decision(ticker, result))
+                except Exception as exc:
+                    log_output = buffer.getvalue()
+                    full_log_output = f"{format_ticker_data_check(data_check_result)}\n\n{log_output}\nERROR: {exc}\n"
+                    combined_logs.append(f"===== {ticker} =====\n{full_log_output}")
+                    (logs_dir / f"{ticker}.log").write_text(full_log_output, encoding="utf-8")
+                    classification, diagnosis = _classify_run_exception(exc)
+                    print(f"[ticker:{ticker}] failed with {classification}: {diagnosis}")
+                    failures.append(
+                        {
+                            "ticker": ticker,
+                            "classification": classification,
+                            "diagnosis": diagnosis,
+                            "error": str(exc),
+                        }
+                    )
+                    if not config.continue_on_error:
+                        break
+    except KeyboardInterrupt:
+        print("Keyboard interrupt received. Writing partial basket artifacts before exit.")
+        failures.append(
+            {
+                "ticker": "RUN_ABORTED",
+                "classification": "unknown_error",
+                "diagnosis": "Run interrupted by user via Ctrl+C.",
+                "error": "KeyboardInterrupt",
+            }
+        )
+    finally:
+        (run_dir / "raw_console_output.txt").write_text("\n".join(combined_logs), encoding="utf-8")
+        _write_json(run_dir / "failures.json", failures)
+        _write_json(run_dir / "data_check.json", data_checks)
+        _write_decisions_csv(run_dir / "combined_decisions.csv", decision_rows)
+        _write_summary(run_dir / "run_summary.md", config, successes, failures, run_dir, data_checks)
     return run_dir
 
 
@@ -330,16 +429,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-symbols", type=int)
     parser.add_argument("--continue-on-error", action="store_true")
     parser.add_argument("--show-reasoning", action="store_true")
+    parser.add_argument("--analyst-preset", type=str, default="all", choices=sorted(ANALYST_PRESETS.keys()))
     parser.add_argument("--start-date", type=str)
     parser.add_argument("--end-date", type=str)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--data-check-only", action="store_true", help="Check data reachability per ticker without calling any LLM")
+    parser.add_argument("--request-timeout-seconds", type=int, default=15)
+    parser.add_argument("--max-data-retries", type=int, default=3)
+    parser.add_argument("--fast-data-mode", "--low-latency-data-mode", dest="fast_data_mode", action="store_true")
     return parser
 
 
 def main() -> int:
     args = build_arg_parser().parse_args()
-    analysts = [analyst_key for _, analyst_key in ANALYST_ORDER]
+    analysts = resolve_analysts_for_preset(args.analyst_preset)
     tickers = _select_tickers(args.tickers, args.basket_name, args.max_symbols)
 
     if not tickers:
@@ -357,7 +460,11 @@ def main() -> int:
         end_date=args.end_date,
         dry_run=args.dry_run,
         data_check_only=args.data_check_only,
+        analyst_preset=args.analyst_preset,
         analysts=analysts,
+        request_timeout_seconds=args.request_timeout_seconds,
+        max_data_retries=args.max_data_retries,
+        fast_data_mode=args.fast_data_mode,
     )
 
     run_dir = run_basket(config)

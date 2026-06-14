@@ -26,7 +26,7 @@ class TestRateLimiting:
         headers = {"X-API-KEY": "test-key"}
         url = "https://api.financialdatasets.ai/test"
         
-        result = _make_api_request(url, headers)
+        result = _make_api_request(url, headers, max_retries=3)
         
         # Verify behavior
         assert result.status_code == 200
@@ -65,7 +65,7 @@ class TestRateLimiting:
         headers = {"X-API-KEY": "test-key"}
         url = "https://api.financialdatasets.ai/test"
         
-        result = _make_api_request(url, headers)
+        result = _make_api_request(url, headers, max_retries=3)
         
         # Verify behavior
         assert result.status_code == 200

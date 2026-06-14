@@ -4,6 +4,7 @@ import os
 import pandas as pd
 import requests
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
@@ -30,6 +31,11 @@ FINANCIAL_DATASETS_API_KEY_ENV_VAR = "FINANCIAL_DATASETS_API_KEY"
 FINANCIAL_DATASETS_BASE_URL = "https://api.financialdatasets.ai"
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 15
 DEFAULT_REQUEST_MAX_ATTEMPTS = 3
+DEFAULT_SKIP_OPTIONAL_SLOW_DATA = False
+
+_request_timeout_seconds = DEFAULT_REQUEST_TIMEOUT_SECONDS
+_request_max_attempts = DEFAULT_REQUEST_MAX_ATTEMPTS
+_skip_optional_slow_data = DEFAULT_SKIP_OPTIONAL_SLOW_DATA
 
 
 @dataclass(frozen=True)
@@ -40,8 +46,48 @@ class FinancialDatasetsRequestSpec:
     json_data: dict | None = None
 
 
+@dataclass(frozen=True)
+class FinancialDataRequestSettings:
+    timeout_seconds: int = DEFAULT_REQUEST_TIMEOUT_SECONDS
+    max_attempts: int = DEFAULT_REQUEST_MAX_ATTEMPTS
+    skip_optional_slow_data: bool = DEFAULT_SKIP_OPTIONAL_SLOW_DATA
+
+
 def get_financial_datasets_api_key(api_key: str | None = None) -> str | None:
     return api_key or os.environ.get(FINANCIAL_DATASETS_API_KEY_ENV_VAR)
+
+
+def get_financial_data_request_settings() -> FinancialDataRequestSettings:
+    return FinancialDataRequestSettings(
+        timeout_seconds=_request_timeout_seconds,
+        max_attempts=_request_max_attempts,
+        skip_optional_slow_data=_skip_optional_slow_data,
+    )
+
+
+@contextmanager
+def financial_data_request_settings(
+    *,
+    timeout_seconds: int | None = None,
+    max_attempts: int | None = None,
+    skip_optional_slow_data: bool | None = None,
+):
+    global _request_timeout_seconds, _request_max_attempts, _skip_optional_slow_data
+
+    previous = get_financial_data_request_settings()
+    if timeout_seconds is not None:
+        _request_timeout_seconds = timeout_seconds
+    if max_attempts is not None:
+        _request_max_attempts = max_attempts
+    if skip_optional_slow_data is not None:
+        _skip_optional_slow_data = skip_optional_slow_data
+
+    try:
+        yield get_financial_data_request_settings()
+    finally:
+        _request_timeout_seconds = previous.timeout_seconds
+        _request_max_attempts = previous.max_attempts
+        _skip_optional_slow_data = previous.skip_optional_slow_data
 
 
 def build_financial_datasets_headers(api_key: str | None = None) -> dict[str, str]:
@@ -95,7 +141,7 @@ def get_financial_datasets_request_specs(
     ]
 
 
-def _make_api_request(url: str, headers: dict, method: str = "GET", json_data: dict = None, max_retries: int = 3) -> requests.Response:
+def _make_api_request(url: str, headers: dict, method: str = "GET", json_data: dict = None, max_retries: int | None = None) -> requests.Response:
     """
     Make an API request with rate limiting handling and moderate backoff.
     
@@ -112,15 +158,16 @@ def _make_api_request(url: str, headers: dict, method: str = "GET", json_data: d
     Raises:
         Exception: If the request fails with a non-429 error
     """
-    max_attempts = max_retries + 1
+    effective_max_retries = max_retries if max_retries is not None else max(_request_max_attempts - 1, 0)
+    max_attempts = effective_max_retries + 1
     last_exception: Exception | None = None
 
     for attempt in range(max_attempts):
         try:
             if method.upper() == "POST":
-                response = requests.post(url, headers=headers, json=json_data, timeout=DEFAULT_REQUEST_TIMEOUT_SECONDS)
+                response = requests.post(url, headers=headers, json=json_data, timeout=_request_timeout_seconds)
             else:
-                response = requests.get(url, headers=headers, timeout=DEFAULT_REQUEST_TIMEOUT_SECONDS)
+                response = requests.get(url, headers=headers, timeout=_request_timeout_seconds)
         except requests.exceptions.RequestException as exc:
             last_exception = exc
             if _should_retry_exception(exc) and attempt < max_attempts - 1:
@@ -299,6 +346,10 @@ def get_insider_trades(
     api_key: str = None,
 ) -> list[InsiderTrade]:
     """Fetch insider trades from cache or API."""
+    if _skip_optional_slow_data:
+        logger.info("Skipping insider trades for %s because optional slow data is disabled.", ticker)
+        return []
+
     # Create a cache key that includes all parameters to ensure exact matches
     cache_key = f"{ticker}_{start_date or 'none'}_{end_date}_{limit}"
     
@@ -362,6 +413,10 @@ def get_company_news(
     api_key: str = None,
 ) -> list[CompanyNews]:
     """Fetch company news from cache or API."""
+    if _skip_optional_slow_data:
+        logger.info("Skipping company news for %s because optional slow data is disabled.", ticker)
+        return []
+
     # Create a cache key that includes all parameters to ensure exact matches
     cache_key = f"{ticker}_{start_date or 'none'}_{end_date}_{limit}"
     
