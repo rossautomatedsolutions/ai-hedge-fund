@@ -4,6 +4,7 @@ from unittest.mock import Mock, patch, call
 
 from src.tools.api import _make_api_request, get_prices
 import requests
+from src.data.cache import Cache
 
 class TestRateLimiting:
     """Test suite for API rate limiting functionality."""
@@ -283,6 +284,91 @@ class TestRateLimiting:
         assert result.status_code == 401
         assert mock_get.call_count == 1
         mock_sleep.assert_not_called()
+
+    def test_identical_get_is_served_from_request_cache(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setattr("src.tools.api._cache", Cache())
+
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"prices": [{"time": "2024-01-01T00:00:00Z"}]}
+        mock_response.text = '{"prices":[{"time":"2024-01-01T00:00:00Z"}]}'
+
+        mock_get = Mock(return_value=mock_response)
+        monkeypatch.setattr("src.tools.api.requests.get", mock_get)
+
+        headers = {"X-API-KEY": "test-key"}
+        url = "https://api.financialdatasets.ai/prices/?ticker=AAPL"
+
+        first = _make_api_request(url, headers)
+        second = _make_api_request(url, headers)
+
+        assert first.json() == second.json()
+        assert mock_get.call_count == 1
+
+    def test_identical_post_is_served_from_request_cache(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setattr("src.tools.api._cache", Cache())
+
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"search_results": [{"ticker": "AAPL", "report_period": "2024-12-31", "period": "ttm", "currency": "USD"}]}
+        mock_response.text = '{"search_results":[{"ticker":"AAPL","report_period":"2024-12-31","period":"ttm","currency":"USD"}]}'
+
+        mock_post = Mock(return_value=mock_response)
+        monkeypatch.setattr("src.tools.api.requests.post", mock_post)
+
+        headers = {"X-API-KEY": "test-key"}
+        url = "https://api.financialdatasets.ai/financials/search/line-items"
+        body = {"tickers": ["AAPL"], "line_items": ["revenue"], "end_date": "2025-01-01", "period": "ttm", "limit": 5}
+
+        first = _make_api_request(url, headers, method="POST", json_data=body)
+        second = _make_api_request(url, headers, method="POST", json_data=body)
+
+        assert first.json() == second.json()
+        assert mock_post.call_count == 1
+
+    def test_transient_failure_is_not_cached(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setattr("src.tools.api._cache", Cache())
+
+        mock_get = Mock(side_effect=requests.exceptions.ConnectionError("ConnectionResetError(10054, 'An existing connection was forcibly closed by the remote host')"))
+        monkeypatch.setattr("src.tools.api.requests.get", mock_get)
+
+        headers = {"X-API-KEY": "test-key"}
+        url = "https://api.financialdatasets.ai/prices/?ticker=AAPL"
+
+        with pytest.raises(requests.exceptions.ConnectionError):
+            _make_api_request(url, headers, max_retries=0)
+
+        with pytest.raises(requests.exceptions.ConnectionError):
+            _make_api_request(url, headers, max_retries=0)
+
+        assert mock_get.call_count == 2
+
+    def test_different_post_bodies_use_different_cache_keys(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setattr("src.tools.api._cache", Cache())
+
+        first_response = Mock()
+        first_response.status_code = 200
+        first_response.json.return_value = {"search_results": [{"ticker": "AAPL", "report_period": "2024-12-31", "period": "ttm", "currency": "USD", "revenue": 100}]}
+        first_response.text = '{"search_results":[{"ticker":"AAPL","report_period":"2024-12-31","period":"ttm","currency":"USD","revenue":100}]}'
+
+        second_response = Mock()
+        second_response.status_code = 200
+        second_response.json.return_value = {"search_results": [{"ticker": "AAPL", "report_period": "2024-12-31", "period": "ttm", "currency": "USD", "net_income": 50}]}
+        second_response.text = '{"search_results":[{"ticker":"AAPL","report_period":"2024-12-31","period":"ttm","currency":"USD","net_income":50}]}'
+
+        mock_post = Mock(side_effect=[first_response, second_response])
+        monkeypatch.setattr("src.tools.api.requests.post", mock_post)
+
+        headers = {"X-API-KEY": "test-key"}
+        url = "https://api.financialdatasets.ai/financials/search/line-items"
+        first_body = {"tickers": ["AAPL"], "line_items": ["revenue"], "end_date": "2025-01-01", "period": "ttm", "limit": 5}
+        second_body = {"tickers": ["AAPL"], "line_items": ["net_income"], "end_date": "2025-01-01", "period": "ttm", "limit": 5}
+
+        first = _make_api_request(url, headers, method="POST", json_data=first_body)
+        second = _make_api_request(url, headers, method="POST", json_data=second_body)
+
+        assert first.json() != second.json()
+        assert mock_post.call_count == 2
 
 
 if __name__ == "__main__":

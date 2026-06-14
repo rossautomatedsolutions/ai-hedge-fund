@@ -1,4 +1,5 @@
 import datetime
+import json
 import logging
 import os
 import pandas as pd
@@ -158,13 +159,20 @@ def _make_api_request(url: str, headers: dict, method: str = "GET", json_data: d
     Raises:
         Exception: If the request fails with a non-429 error
     """
+    normalized_method = method.upper()
+    cache_key = _build_request_cache_key(normalized_method, url, json_data=json_data)
+    cached_payload = _cache.get_request_response(cache_key)
+    if _is_cacheable_payload(cached_payload):
+        logger.debug("Using cached financial data response for %s %s", normalized_method, url)
+        return _build_cached_response(url, cached_payload)
+
     effective_max_retries = max_retries if max_retries is not None else max(_request_max_attempts - 1, 0)
     max_attempts = effective_max_retries + 1
     last_exception: Exception | None = None
 
     for attempt in range(max_attempts):
         try:
-            if method.upper() == "POST":
+            if normalized_method == "POST":
                 response = requests.post(url, headers=headers, json=json_data, timeout=_request_timeout_seconds)
             else:
                 response = requests.get(url, headers=headers, timeout=_request_timeout_seconds)
@@ -174,7 +182,7 @@ def _make_api_request(url: str, headers: dict, method: str = "GET", json_data: d
                 delay = _retry_backoff_delay_seconds(attempt)
                 logger.warning(
                     "Transient financial data request failure for %s %s on attempt %s/%s: %s. Retrying in %.1fs.",
-                    method.upper(),
+                    normalized_method,
                     url,
                     attempt + 1,
                     max_attempts,
@@ -189,7 +197,7 @@ def _make_api_request(url: str, headers: dict, method: str = "GET", json_data: d
             delay = _retry_backoff_delay_seconds(attempt)
             logger.warning(
                 "Transient financial data response for %s %s on attempt %s/%s: HTTP %s. Retrying in %.1fs.",
-                method.upper(),
+                normalized_method,
                 url,
                 attempt + 1,
                 max_attempts,
@@ -199,11 +207,53 @@ def _make_api_request(url: str, headers: dict, method: str = "GET", json_data: d
             time.sleep(delay)
             continue
 
+        if response.status_code == 200:
+            try:
+                parsed_payload = response.json()
+            except ValueError:
+                logger.debug("Skipping cache for %s %s because response JSON could not be parsed.", normalized_method, url)
+            else:
+                if _is_cacheable_payload(parsed_payload):
+                    _cache.set_request_response(cache_key, parsed_payload)
         return response
 
     if last_exception is not None:
         raise last_exception
-    raise RuntimeError(f"Financial data request exhausted retries without a response: {method.upper()} {url}")
+    raise RuntimeError(f"Financial data request exhausted retries without a response: {normalized_method} {url}")
+
+
+def _normalize_json_for_cache(json_data: dict | None) -> str:
+    """Return a stable string representation for POST request bodies."""
+    if json_data is None:
+        return ""
+    return json.dumps(json_data, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+
+def _build_request_cache_key(method: str, url: str, json_data: dict | None = None) -> str:
+    """Build an exact-match cache key for a request."""
+    return f"{method.upper()} {url} {_normalize_json_for_cache(json_data)}"
+
+
+def _is_cacheable_payload(payload: object) -> bool:
+    """Allow only JSON-serializable parsed payloads in the request cache."""
+    if payload is None:
+        return False
+    try:
+        json.dumps(payload, ensure_ascii=True)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def _build_cached_response(url: str, payload: dict | list | str | int | float | bool | None) -> requests.Response:
+    """Create a lightweight Response object from cached JSON payload data."""
+    response = requests.Response()
+    response.status_code = 200
+    response.url = url
+    response.encoding = "utf-8"
+    response.headers["Content-Type"] = "application/json"
+    response._content = json.dumps(payload, ensure_ascii=True).encode("utf-8")
+    return response
 
 
 def _retry_backoff_delay_seconds(attempt: int) -> float:

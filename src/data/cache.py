@@ -1,3 +1,9 @@
+from __future__ import annotations
+
+from copy import deepcopy
+from typing import Any
+
+
 class Cache:
     """In-memory cache for API responses."""
 
@@ -7,6 +13,7 @@ class Cache:
         self._line_items_cache: dict[str, list[dict[str, any]]] = {}
         self._insider_trades_cache: dict[str, list[dict[str, any]]] = {}
         self._company_news_cache: dict[str, list[dict[str, any]]] = {}
+        self._request_response_cache: dict[str, Any] = {}
 
     def _merge_data(self, existing: list[dict] | None, new_data: list[dict], key_field: str) -> list[dict]:
         """Merge existing and new data, avoiding duplicates based on a key field."""
@@ -60,6 +67,15 @@ class Cache:
     def set_company_news(self, ticker: str, data: list[dict[str, any]]):
         """Append new company news to cache."""
         self._company_news_cache[ticker] = self._merge_data(self._company_news_cache.get(ticker), data, key_field="date")
+
+    def get_request_response(self, cache_key: str) -> Any | None:
+        """Get a cached HTTP response payload for an exact request match."""
+        cached = self._request_response_cache.get(cache_key)
+        return deepcopy(cached) if cached is not None else None
+
+    def set_request_response(self, cache_key: str, payload: Any):
+        """Store a parsed HTTP response payload for an exact request match."""
+        self._request_response_cache[cache_key] = deepcopy(payload)
 
 
 # Global cache instance
