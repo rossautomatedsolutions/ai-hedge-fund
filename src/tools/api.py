@@ -29,6 +29,7 @@ _cache = get_cache()
 FINANCIAL_DATASETS_API_KEY_ENV_VAR = "FINANCIAL_DATASETS_API_KEY"
 FINANCIAL_DATASETS_BASE_URL = "https://api.financialdatasets.ai"
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 15
+DEFAULT_REQUEST_MAX_ATTEMPTS = 3
 
 
 @dataclass(frozen=True)
@@ -111,21 +112,75 @@ def _make_api_request(url: str, headers: dict, method: str = "GET", json_data: d
     Raises:
         Exception: If the request fails with a non-429 error
     """
-    for attempt in range(max_retries + 1):  # +1 for initial attempt
-        if method.upper() == "POST":
-            response = requests.post(url, headers=headers, json=json_data)
-        else:
-            response = requests.get(url, headers=headers)
-        
-        if response.status_code == 429 and attempt < max_retries:
-            # Linear backoff: 60s, 90s, 120s, 150s...
-            delay = 60 + (30 * attempt)
-            print(f"Rate limited (429). Attempt {attempt + 1}/{max_retries + 1}. Waiting {delay}s before retrying...")
+    max_attempts = max_retries + 1
+    last_exception: Exception | None = None
+
+    for attempt in range(max_attempts):
+        try:
+            if method.upper() == "POST":
+                response = requests.post(url, headers=headers, json=json_data, timeout=DEFAULT_REQUEST_TIMEOUT_SECONDS)
+            else:
+                response = requests.get(url, headers=headers, timeout=DEFAULT_REQUEST_TIMEOUT_SECONDS)
+        except requests.exceptions.RequestException as exc:
+            last_exception = exc
+            if _should_retry_exception(exc) and attempt < max_attempts - 1:
+                delay = _retry_backoff_delay_seconds(attempt)
+                logger.warning(
+                    "Transient financial data request failure for %s %s on attempt %s/%s: %s. Retrying in %.1fs.",
+                    method.upper(),
+                    url,
+                    attempt + 1,
+                    max_attempts,
+                    exc,
+                    delay,
+                )
+                time.sleep(delay)
+                continue
+            raise
+
+        if _should_retry_response(response) and attempt < max_attempts - 1:
+            delay = _retry_backoff_delay_seconds(attempt)
+            logger.warning(
+                "Transient financial data response for %s %s on attempt %s/%s: HTTP %s. Retrying in %.1fs.",
+                method.upper(),
+                url,
+                attempt + 1,
+                max_attempts,
+                response.status_code,
+                delay,
+            )
             time.sleep(delay)
             continue
-        
-        # Return the response (whether success, other errors, or final 429)
+
         return response
+
+    if last_exception is not None:
+        raise last_exception
+    raise RuntimeError(f"Financial data request exhausted retries without a response: {method.upper()} {url}")
+
+
+def _retry_backoff_delay_seconds(attempt: int) -> float:
+    """Return exponential backoff delay for zero-based retry attempt."""
+    return float(2**attempt)
+
+
+def _should_retry_response(response: requests.Response) -> bool:
+    """Retry only transient HTTP status codes."""
+    return response.status_code == 429 or 500 <= response.status_code <= 599
+
+
+def _should_retry_exception(exc: requests.exceptions.RequestException) -> bool:
+    """Retry transient network/SSL/timeouts, but not deterministic request failures."""
+    if isinstance(exc, requests.exceptions.SSLError):
+        return True
+    if isinstance(exc, (requests.exceptions.ConnectTimeout, requests.exceptions.ReadTimeout, requests.exceptions.Timeout)):
+        return True
+    if isinstance(exc, requests.exceptions.ConnectionError):
+        message = str(exc).lower()
+        if "10054" in message or "forcibly closed" in message or "connectionreseterror" in message:
+            return True
+        return True
+    return False
 
 
 def get_prices(ticker: str, start_date: str, end_date: str, api_key: str = None) -> list[Price]:

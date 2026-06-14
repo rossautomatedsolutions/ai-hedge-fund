@@ -8,9 +8,9 @@ from typing import Any
 import requests
 
 from src.tools.api import (
-    DEFAULT_REQUEST_TIMEOUT_SECONDS,
     FINANCIAL_DATASETS_API_KEY_ENV_VAR,
     FinancialDatasetsRequestSpec,
+    _make_api_request,
     build_financial_datasets_headers,
     get_financial_datasets_api_key,
     get_financial_datasets_request_specs,
@@ -164,10 +164,13 @@ def _run_request_check(spec: FinancialDatasetsRequestSpec, *, api_key: str | Non
     headers = build_financial_datasets_headers(api_key)
     has_api_key = bool(get_financial_datasets_api_key(api_key))
     try:
-        if spec.method.upper() == "POST":
-            response = requests.post(spec.url, headers=headers, json=spec.json_data, timeout=DEFAULT_REQUEST_TIMEOUT_SECONDS)
-        else:
-            response = requests.get(spec.url, headers=headers, timeout=DEFAULT_REQUEST_TIMEOUT_SECONDS)
+        response = _make_api_request(
+            spec.url,
+            headers,
+            method=spec.method,
+            json_data=spec.json_data,
+            max_retries=2,
+        )
         classification, diagnosis, record_count = _classify_response(spec, response, has_api_key=has_api_key)
         return EndpointCheckResult(
             name=spec.name,

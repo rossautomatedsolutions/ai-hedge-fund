@@ -189,15 +189,14 @@ def test_basket_runner_continue_on_error_writes_failures(tmp_path: Path, monkeyp
 def test_run_ticker_data_check_classifies_missing_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("FINANCIAL_DATASETS_API_KEY", raising=False)
 
-    def fake_get(url, headers, timeout):
+    def fake_make_api_request(url, headers, method="GET", json_data=None, max_retries=2):
         response = Mock()
         response.status_code = 401
         response.text = '{"error":"Missing API key","message":"Please include an X-API-KEY"}'
         response.json.return_value = {"error": "Missing API key", "message": "Please include an X-API-KEY"}
         return response
 
-    monkeypatch.setattr("src.data_diagnostics.requests.get", fake_get)
-    monkeypatch.setattr("src.data_diagnostics.requests.post", lambda url, headers, json, timeout: fake_get(url, headers, timeout))
+    monkeypatch.setattr("src.data_diagnostics._make_api_request", fake_make_api_request)
 
     result = run_ticker_data_check("BB", "2026-01-01", "2026-06-01")
 
@@ -209,7 +208,7 @@ def test_run_ticker_data_check_classifies_missing_api_key(monkeypatch: pytest.Mo
 def test_run_ticker_data_check_accepts_public_http_200_without_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("FINANCIAL_DATASETS_API_KEY", raising=False)
 
-    def fake_get(url, headers, timeout):
+    def fake_make_api_request(url, headers, method="GET", json_data=None, max_retries=2):
         response = Mock()
         response.status_code = 200
         response.text = "ok"
@@ -217,21 +216,15 @@ def test_run_ticker_data_check_accepts_public_http_200_without_api_key(monkeypat
             response.json.return_value = {"prices": [{"time": "2026-01-01T00:00:00Z"}]}
         elif "financial-metrics" in url:
             response.json.return_value = {"financial_metrics": [{"market_cap": 1}]}
+        elif "line-items" in url:
+            response.json.return_value = {"search_results": [{"ticker": "AAPL"}]}
         elif "company/facts" in url:
             response.json.return_value = {"company_facts": {"market_cap": 1}}
         else:
             response.json.return_value = {}
         return response
 
-    def fake_post(url, headers, json, timeout):
-        response = Mock()
-        response.status_code = 200
-        response.text = "ok"
-        response.json.return_value = {"search_results": [{"ticker": "AAPL"}]}
-        return response
-
-    monkeypatch.setattr("src.data_diagnostics.requests.get", fake_get)
-    monkeypatch.setattr("src.data_diagnostics.requests.post", fake_post)
+    monkeypatch.setattr("src.data_diagnostics._make_api_request", fake_make_api_request)
 
     result = run_ticker_data_check("AAPL", "2026-01-01", "2026-06-01")
 
@@ -243,15 +236,14 @@ def test_run_ticker_data_check_accepts_public_http_200_without_api_key(monkeypat
 def test_run_ticker_data_check_classifies_unauthorized_401(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("FINANCIAL_DATASETS_API_KEY", "bad-key")
 
-    def fake_get(url, headers, timeout):
+    def fake_make_api_request(url, headers, method="GET", json_data=None, max_retries=2):
         response = Mock()
         response.status_code = 401
         response.text = "Unauthorized"
         response.json.return_value = {"detail": "Unauthorized"}
         return response
 
-    monkeypatch.setattr("src.data_diagnostics.requests.get", fake_get)
-    monkeypatch.setattr("src.data_diagnostics.requests.post", lambda url, headers, json, timeout: fake_get(url, headers, timeout))
+    monkeypatch.setattr("src.data_diagnostics._make_api_request", fake_make_api_request)
 
     result = run_ticker_data_check("BB", "2026-01-01", "2026-06-01")
 
@@ -262,7 +254,7 @@ def test_run_ticker_data_check_classifies_unauthorized_401(monkeypatch: pytest.M
 def test_run_ticker_data_check_classifies_partial_data(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("FINANCIAL_DATASETS_API_KEY", raising=False)
 
-    def fake_get(url, headers, timeout):
+    def fake_make_api_request(url, headers, method="GET", json_data=None, max_retries=2):
         response = Mock()
         if "prices" in url:
             response.status_code = 200
@@ -282,15 +274,7 @@ def test_run_ticker_data_check_classifies_partial_data(monkeypatch: pytest.Monke
             response.json.return_value = {}
         return response
 
-    def fake_post(url, headers, json, timeout):
-        response = Mock()
-        response.status_code = 200
-        response.text = "ok"
-        response.json.return_value = {"search_results": [{"ticker": "GOOGL"}]}
-        return response
-
-    monkeypatch.setattr("src.data_diagnostics.requests.get", fake_get)
-    monkeypatch.setattr("src.data_diagnostics.requests.post", fake_post)
+    monkeypatch.setattr("src.data_diagnostics._make_api_request", fake_make_api_request)
 
     result = run_ticker_data_check("GOOGL", "2026-01-01", "2026-06-01")
 
@@ -302,7 +286,7 @@ def test_run_ticker_data_check_classifies_partial_data(monkeypatch: pytest.Monke
 def test_run_ticker_data_check_classifies_empty_success_payload_as_missing_data(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("FINANCIAL_DATASETS_API_KEY", raising=False)
 
-    def fake_get(url, headers, timeout):
+    def fake_make_api_request(url, headers, method="GET", json_data=None, max_retries=2):
         response = Mock()
         response.status_code = 200
         response.text = "ok"
@@ -316,15 +300,7 @@ def test_run_ticker_data_check_classifies_empty_success_payload_as_missing_data(
             response.json.return_value = {}
         return response
 
-    def fake_post(url, headers, json, timeout):
-        response = Mock()
-        response.status_code = 200
-        response.text = "ok"
-        response.json.return_value = {"search_results": []}
-        return response
-
-    monkeypatch.setattr("src.data_diagnostics.requests.get", fake_get)
-    monkeypatch.setattr("src.data_diagnostics.requests.post", fake_post)
+    monkeypatch.setattr("src.data_diagnostics._make_api_request", fake_make_api_request)
 
     result = run_ticker_data_check("ZZZZ", "2026-01-01", "2026-06-01")
 
@@ -336,16 +312,30 @@ def test_run_ticker_data_check_classifies_empty_success_payload_as_missing_data(
 def test_run_ticker_data_check_classifies_connection_reset(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("FINANCIAL_DATASETS_API_KEY", "test-key")
 
-    def fake_get(url, headers, timeout):
+    def fake_make_api_request(url, headers, method="GET", json_data=None, max_retries=2):
         raise requests.exceptions.ConnectionError("ConnectionResetError(10054, 'An existing connection was forcibly closed by the remote host')")
 
-    monkeypatch.setattr("src.data_diagnostics.requests.get", fake_get)
-    monkeypatch.setattr("src.data_diagnostics.requests.post", lambda url, headers, json, timeout: fake_get(url, headers, timeout))
+    monkeypatch.setattr("src.data_diagnostics._make_api_request", fake_make_api_request)
 
     result = run_ticker_data_check("BB", "2026-01-01", "2026-06-01")
 
     assert result.ok is False
     assert result.classification == "connection_reset"
+
+
+def test_run_ticker_data_check_keeps_ssl_error_after_retries_exhausted(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("FINANCIAL_DATASETS_API_KEY", "test-key")
+
+    def fake_make_api_request(url, headers, method="GET", json_data=None, max_retries=2):
+        raise requests.exceptions.SSLError("EOF occurred in violation of protocol")
+
+    monkeypatch.setattr("src.data_diagnostics._make_api_request", fake_make_api_request)
+
+    result = run_ticker_data_check("AAPL", "2026-01-01", "2026-06-01")
+
+    assert result.ok is False
+    assert result.partial_ok is False
+    assert result.classification == "ssl_error"
 
 
 def test_basket_runner_data_check_only_writes_diagnostics(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

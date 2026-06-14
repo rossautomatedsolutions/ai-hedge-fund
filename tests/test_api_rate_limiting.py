@@ -3,6 +3,7 @@ import pytest
 from unittest.mock import Mock, patch, call
 
 from src.tools.api import _make_api_request, get_prices
+import requests
 
 class TestRateLimiting:
     """Test suite for API rate limiting functionality."""
@@ -34,12 +35,12 @@ class TestRateLimiting:
         # Verify requests.get was called twice
         assert mock_get.call_count == 2
         mock_get.assert_has_calls([
-            call(url, headers=headers),
-            call(url, headers=headers)
+            call(url, headers=headers, timeout=15),
+            call(url, headers=headers, timeout=15)
         ])
         
-        # Verify sleep was called once with 60 seconds (first retry)
-        mock_sleep.assert_called_once_with(60)
+        # Verify sleep was called once with 1 second (first retry)
+        mock_sleep.assert_called_once_with(1.0)
 
     @patch('src.tools.api.time.sleep')
     @patch('src.tools.api.requests.get')
@@ -73,9 +74,9 @@ class TestRateLimiting:
         # Verify requests.get was called 4 times
         assert mock_get.call_count == 4
         
-        # Verify sleep was called 3 times with linear backoff: 60s, 90s, 120s
+        # Verify sleep was called 3 times with exponential backoff: 1s, 2s, 4s
         assert mock_sleep.call_count == 3
-        expected_calls = [call(60), call(90), call(120)]
+        expected_calls = [call(1.0), call(2.0), call(4.0)]
         mock_sleep.assert_has_calls(expected_calls)
 
     @patch('src.tools.api.time.sleep')
@@ -106,23 +107,27 @@ class TestRateLimiting:
         # Verify requests.post was called twice
         assert mock_post.call_count == 2
         mock_post.assert_has_calls([
-            call(url, headers=headers, json=json_data),
-            call(url, headers=headers, json=json_data)
+            call(url, headers=headers, json=json_data, timeout=15),
+            call(url, headers=headers, json=json_data, timeout=15)
         ])
         
-        # Verify sleep was called once with 60 seconds (first retry)
-        mock_sleep.assert_called_once_with(60)
+        # Verify sleep was called once with 1 second (first retry)
+        mock_sleep.assert_called_once_with(1.0)
 
     @patch('src.tools.api.time.sleep')
     @patch('src.tools.api.requests.get')
     def test_ignores_other_errors(self, mock_get, mock_sleep):
         """Test that non-429 errors are returned without retrying."""
-        # Setup mock response: 500 error
+        # Setup mock response: 500 error followed by success
         mock_500_response = Mock()
         mock_500_response.status_code = 500
         mock_500_response.text = "Internal Server Error"
+
+        mock_200_response = Mock()
+        mock_200_response.status_code = 200
+        mock_200_response.text = "Success"
         
-        mock_get.return_value = mock_500_response
+        mock_get.side_effect = [mock_500_response, mock_200_response]
         
         # Call the function
         headers = {"X-API-KEY": "test-key"}
@@ -131,14 +136,14 @@ class TestRateLimiting:
         result = _make_api_request(url, headers)
         
         # Verify behavior
-        assert result.status_code == 500
-        assert result.text == "Internal Server Error"
+        assert result.status_code == 200
+        assert result.text == "Success"
         
-        # Verify requests.get was called only once
-        assert mock_get.call_count == 1
+        # Verify requests.get was called twice
+        assert mock_get.call_count == 2
         
-        # Verify sleep was never called
-        mock_sleep.assert_not_called()
+        # Verify sleep was called with the first backoff interval
+        mock_sleep.assert_called_once_with(1.0)
 
     @patch('src.tools.api.time.sleep')
     @patch('src.tools.api.requests.get')
@@ -209,7 +214,7 @@ class TestRateLimiting:
         
         # Verify rate limiting behavior
         assert mock_get.call_count == 2
-        mock_sleep.assert_called_once_with(60)
+        mock_sleep.assert_called_once_with(1.0)
         
         # Verify cache operations
         mock_cache.get_prices.assert_called_once()
@@ -239,10 +244,45 @@ class TestRateLimiting:
         # Verify requests.get was called 3 times (1 initial + 2 retries)
         assert mock_get.call_count == 3
         
-        # Verify sleep was called 2 times with linear backoff: 60s, 90s
+        # Verify sleep was called 2 times with exponential backoff: 1s, 2s
         assert mock_sleep.call_count == 2
-        expected_calls = [call(60), call(90)]
+        expected_calls = [call(1.0), call(2.0)]
         mock_sleep.assert_has_calls(expected_calls)
+
+    @patch('src.tools.api.time.sleep')
+    @patch('src.tools.api.requests.get')
+    def test_retries_ssl_error_then_succeeds(self, mock_get, mock_sleep):
+        """Transient SSL failures should be retried."""
+        mock_200_response = Mock()
+        mock_200_response.status_code = 200
+        mock_200_response.text = "Success"
+
+        mock_get.side_effect = [
+            requests.exceptions.SSLError("EOF occurred in violation of protocol"),
+            mock_200_response,
+        ]
+
+        result = _make_api_request("https://api.financialdatasets.ai/test", {"X-API-KEY": "test-key"})
+
+        assert result.status_code == 200
+        assert mock_get.call_count == 2
+        mock_sleep.assert_called_once_with(1.0)
+
+    @patch('src.tools.api.time.sleep')
+    @patch('src.tools.api.requests.get')
+    def test_does_not_retry_401_missing_key(self, mock_get, mock_sleep):
+        """Deterministic auth failures should not be retried."""
+        mock_401_response = Mock()
+        mock_401_response.status_code = 401
+        mock_401_response.text = '{"error":"Missing API key"}'
+
+        mock_get.return_value = mock_401_response
+
+        result = _make_api_request("https://api.financialdatasets.ai/test", {})
+
+        assert result.status_code == 401
+        assert mock_get.call_count == 1
+        mock_sleep.assert_not_called()
 
 
 if __name__ == "__main__":
