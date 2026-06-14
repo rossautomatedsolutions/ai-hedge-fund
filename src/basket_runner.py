@@ -60,6 +60,26 @@ ANALYST_PRESETS = {
     "technical-only": ["technical_analyst"],
 }
 NEWS_DISABLED_ANALYSTS = {"sentiment_analyst", "news_sentiment_analyst"}
+DECISION_CSV_FIELDNAMES = [
+    "ticker",
+    "action",
+    "quantity",
+    "confidence",
+    "reasoning",
+    "analyst_preset",
+    "model",
+    "provider",
+    "data_status",
+    "failure_classification",
+    "bullish_count",
+    "bearish_count",
+    "neutral_count",
+    "run_status",
+]
+DECISION_SUMMARY_DISCLAIMER = (
+    "Educational use only. This report is not financial advice, not an offer to buy or sell securities, "
+    "and not a recommendation to take any trading action."
+)
 
 
 def _parse_tickers(raw_tickers: str | None) -> list[str]:
@@ -222,14 +242,106 @@ def _write_summary(
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def _flatten_decision(ticker: str, result: dict[str, Any]) -> dict[str, Any]:
+def _stringify_reasoning(value: Any) -> str:
+    if value in (None, ""):
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=True)
+    return str(value)
+
+
+def _signal_counts(result: dict[str, Any], ticker: str) -> tuple[int, int, int]:
+    analyst_signals = result.get("analyst_signals", {})
+    if not isinstance(analyst_signals, dict):
+        return (0, 0, 0)
+
+    bullish_count = 0
+    bearish_count = 0
+    neutral_count = 0
+
+    for signals in analyst_signals.values():
+        if not isinstance(signals, dict):
+            continue
+        signal_payload = signals.get(ticker)
+        if not isinstance(signal_payload, dict):
+            continue
+        signal = str(signal_payload.get("signal") or "").upper()
+        if signal == "BULLISH":
+            bullish_count += 1
+        elif signal == "BEARISH":
+            bearish_count += 1
+        elif signal == "NEUTRAL":
+            neutral_count += 1
+
+    return (bullish_count, bearish_count, neutral_count)
+
+
+def _data_status(check: dict[str, Any] | None) -> str:
+    if not check:
+        return ""
+    if check.get("ok"):
+        return "ok"
+    classification = check.get("classification")
+    return str(classification) if classification else "failed"
+
+
+def _flatten_decision(
+    ticker: str,
+    result: dict[str, Any],
+    *,
+    config: BasketRunConfig,
+    data_check: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     decision = (result.get("decisions") or {}).get(ticker) or {}
+    bullish_count, bearish_count, neutral_count = _signal_counts(result, ticker)
     return {
         "ticker": ticker,
         "action": decision.get("action", "UNKNOWN"),
         "quantity": decision.get("quantity", ""),
         "confidence": decision.get("confidence", ""),
-        "reasoning": decision.get("reasoning", ""),
+        "reasoning": _stringify_reasoning(decision.get("reasoning", "")),
+        "analyst_preset": config.analyst_preset,
+        "model": config.model,
+        "provider": config.model_provider,
+        "data_status": _data_status(data_check),
+        "failure_classification": "",
+        "bullish_count": bullish_count,
+        "bearish_count": bearish_count,
+        "neutral_count": neutral_count,
+        "run_status": "success",
+    }
+
+
+def _failure_row(
+    ticker: str,
+    *,
+    config: BasketRunConfig,
+    failure: dict[str, Any] | None = None,
+    data_check: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    classification = ""
+    if failure:
+        classification = str(failure.get("classification") or "")
+    reasoning = ""
+    if failure:
+        reasoning = _stringify_reasoning(failure.get("diagnosis") or failure.get("error") or "")
+    return {
+        "ticker": ticker,
+        "action": "",
+        "quantity": "",
+        "confidence": "",
+        "reasoning": reasoning,
+        "analyst_preset": config.analyst_preset,
+        "model": config.model,
+        "provider": config.model_provider,
+        "data_status": _data_status(data_check),
+        "failure_classification": classification,
+        "bullish_count": 0,
+        "bearish_count": 0,
+        "neutral_count": 0,
+        "run_status": "failed",
     }
 
 
@@ -237,9 +349,29 @@ def _write_decisions_csv(path: Path, rows: list[dict[str, Any]]) -> None:
     if not rows:
         return
     with path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=["ticker", "action", "quantity", "confidence", "reasoning"])
+        writer = csv.DictWriter(handle, fieldnames=DECISION_CSV_FIELDNAMES)
         writer.writeheader()
         writer.writerows(rows)
+
+
+def _write_decision_summary(path: Path, rows: list[dict[str, Any]]) -> None:
+    lines = [
+        "# Decision Summary",
+        "",
+        DECISION_SUMMARY_DISCLAIMER,
+        "",
+        "| Ticker | Action | Confidence | Reasoning | Run Status |",
+        "| --- | --- | --- | --- | --- |",
+    ]
+    for row in rows:
+        action = str(row.get("action") or "").strip() or "FAILED"
+        confidence = str(row.get("confidence") or "").strip()
+        reasoning = str(row.get("reasoning") or "").replace("\n", " ").replace("|", "\\|").strip()
+        run_status = str(row.get("run_status") or "").strip() or "unknown"
+        lines.append(
+            f"| {row.get('ticker', '')} | {action} | {confidence} | {reasoning} | {run_status} |"
+        )
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def _classify_run_exception(exc: Exception) -> tuple[str, str]:
@@ -298,6 +430,7 @@ def run_basket(config: BasketRunConfig) -> Path:
         _write_json(run_dir / "failures.json", failures)
         _write_json(run_dir / "data_check.json", data_checks)
         (run_dir / "raw_console_output.txt").write_text("", encoding="utf-8")
+        _write_decision_summary(run_dir / "decision_summary.md", decision_rows)
         _write_summary(run_dir / "run_summary.md", config, successes, failures, run_dir, data_checks)
         return run_dir
 
@@ -331,13 +464,20 @@ def run_basket(config: BasketRunConfig) -> Path:
                     if data_check_result.ok:
                         successes.append({"ticker": ticker, "mode": "data-check-only"})
                     else:
-                        failures.append(
-                            {
-                                "ticker": ticker,
-                                "classification": data_check_result.classification,
-                                "diagnosis": data_check_result.diagnosis,
-                                "error": data_check_result.diagnosis,
-                            }
+                        failure_payload = {
+                            "ticker": ticker,
+                            "classification": data_check_result.classification,
+                            "diagnosis": data_check_result.diagnosis,
+                            "error": data_check_result.diagnosis,
+                        }
+                        failures.append(failure_payload)
+                        decision_rows.append(
+                            _failure_row(
+                                ticker,
+                                config=config,
+                                failure=failure_payload,
+                                data_check=data_check_payload,
+                            )
                         )
                     continue
 
@@ -346,13 +486,20 @@ def run_basket(config: BasketRunConfig) -> Path:
                     print(f"[ticker:{ticker}] stopping before live run: {message}")
                     combined_logs.append(f"===== {ticker} =====\n{format_ticker_data_check(data_check_result)}\nERROR: {message}\n")
                     (logs_dir / f"{ticker}.log").write_text(f"{format_ticker_data_check(data_check_result)}\nERROR: {message}\n", encoding="utf-8")
-                    failures.append(
-                        {
-                            "ticker": ticker,
-                            "classification": data_check_result.classification,
-                            "diagnosis": data_check_result.diagnosis,
-                            "error": message,
-                        }
+                    failure_payload = {
+                        "ticker": ticker,
+                        "classification": data_check_result.classification,
+                        "diagnosis": data_check_result.diagnosis,
+                        "error": message,
+                    }
+                    failures.append(failure_payload)
+                    decision_rows.append(
+                        _failure_row(
+                            ticker,
+                            config=config,
+                            failure=failure_payload,
+                            data_check=data_check_payload,
+                        )
                     )
                     if not config.continue_on_error:
                         break
@@ -383,7 +530,7 @@ def run_basket(config: BasketRunConfig) -> Path:
                     (logs_dir / f"{ticker}.log").write_text(full_log_output, encoding="utf-8")
                     print(f"[ticker:{ticker}] completed successfully | log={logs_dir / f'{ticker}.log'}")
                     successes.append({"ticker": ticker})
-                    decision_rows.append(_flatten_decision(ticker, result))
+                    decision_rows.append(_flatten_decision(ticker, result, config=config, data_check=data_check_payload))
                 except Exception as exc:
                     log_output = buffer.getvalue()
                     full_log_output = f"{format_ticker_data_check(data_check_result)}\n\n{log_output}\nERROR: {exc}\n"
@@ -391,13 +538,20 @@ def run_basket(config: BasketRunConfig) -> Path:
                     (logs_dir / f"{ticker}.log").write_text(full_log_output, encoding="utf-8")
                     classification, diagnosis = _classify_run_exception(exc)
                     print(f"[ticker:{ticker}] failed with {classification}: {diagnosis}")
-                    failures.append(
-                        {
-                            "ticker": ticker,
-                            "classification": classification,
-                            "diagnosis": diagnosis,
-                            "error": str(exc),
-                        }
+                    failure_payload = {
+                        "ticker": ticker,
+                        "classification": classification,
+                        "diagnosis": diagnosis,
+                        "error": str(exc),
+                    }
+                    failures.append(failure_payload)
+                    decision_rows.append(
+                        _failure_row(
+                            ticker,
+                            config=config,
+                            failure=failure_payload,
+                            data_check=data_check_payload,
+                        )
                     )
                     if not config.continue_on_error:
                         break
@@ -416,6 +570,7 @@ def run_basket(config: BasketRunConfig) -> Path:
         _write_json(run_dir / "failures.json", failures)
         _write_json(run_dir / "data_check.json", data_checks)
         _write_decisions_csv(run_dir / "combined_decisions.csv", decision_rows)
+        _write_decision_summary(run_dir / "decision_summary.md", decision_rows)
         _write_summary(run_dir / "run_summary.md", config, successes, failures, run_dir, data_checks)
     return run_dir
 

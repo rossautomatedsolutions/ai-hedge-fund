@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 from pathlib import Path
 from unittest.mock import Mock
@@ -7,7 +8,14 @@ from unittest.mock import Mock
 import pytest
 import requests
 
-from src.basket_runner import BasketRunConfig, resolve_analysts_for_preset, resolve_data_request_options, run_basket
+from src.basket_runner import (
+    DECISION_CSV_FIELDNAMES,
+    DECISION_SUMMARY_DISCLAIMER,
+    BasketRunConfig,
+    resolve_analysts_for_preset,
+    resolve_data_request_options,
+    run_basket,
+)
 from src.cli.input import resolve_model_selection, select_model
 from src.data_diagnostics import run_ticker_data_check
 from src.utils.display import print_trading_output
@@ -106,6 +114,7 @@ def test_basket_runner_dry_run_writes_manifest_and_summary(tmp_path: Path) -> No
     assert manifest["dry_run"] is True
     assert (run_dir / "failures.json").exists()
     assert (run_dir / "data_check.json").exists()
+    assert (run_dir / "decision_summary.md").exists()
 
 
 def test_basket_runner_continue_on_error_writes_failures(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -185,13 +194,115 @@ def test_basket_runner_continue_on_error_writes_failures(tmp_path: Path, monkeyp
 
     failures = json.loads((run_dir / "failures.json").read_text(encoding="utf-8"))
     summary = (run_dir / "run_summary.md").read_text(encoding="utf-8")
-    combined_csv = (run_dir / "combined_decisions.csv").read_text(encoding="utf-8")
+    combined_csv = list(csv.DictReader((run_dir / "combined_decisions.csv").open(encoding="utf-8", newline="")))
+    decision_summary = (run_dir / "decision_summary.md").read_text(encoding="utf-8")
 
     assert failures[0]["ticker"] == "BB"
     assert failures[0]["error"] == "boom-BB"
     assert failures[0]["classification"] == "unknown_error"
     assert "Failures" in summary
-    assert "GME" in combined_csv
+    assert [row["ticker"] for row in combined_csv] == ["BB", "GME"]
+    assert combined_csv[0]["run_status"] == "failed"
+    assert combined_csv[0]["failure_classification"] == "unknown_error"
+    assert combined_csv[1]["run_status"] == "success"
+    assert "Decision Summary" in decision_summary
+    assert DECISION_SUMMARY_DISCLAIMER in decision_summary
+    assert "| BB | FAILED |" in decision_summary
+    assert "| GME | hold | 50 | ok | success |" in decision_summary
+
+
+def test_basket_runner_combined_csv_includes_requested_columns_and_signal_counts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("src.basket_runner.ensure_ollama_and_model", lambda model, interactive=False: True)
+    monkeypatch.setattr("src.basket_runner.print_trading_output", lambda result: None)
+    monkeypatch.setattr(
+        "src.basket_runner.run_ticker_data_check",
+        lambda ticker, start_date, end_date: type(
+            "Check",
+            (),
+            {
+                "ticker": ticker,
+                "ok": True,
+                "classification": "ok",
+                "diagnosis": "All good",
+                "env_var": "FINANCIAL_DATASETS_API_KEY",
+                "checked_at": "2026-06-13T00:00:00",
+                "checks": [],
+            },
+        )(),
+    )
+    monkeypatch.setattr(
+        "src.basket_runner.ticker_data_check_to_dict",
+        lambda result: {
+            "ticker": result.ticker,
+            "ok": result.ok,
+            "classification": result.classification,
+            "diagnosis": result.diagnosis,
+            "env_var": result.env_var,
+            "checked_at": result.checked_at,
+            "checks": result.checks,
+        },
+    )
+    monkeypatch.setattr("src.basket_runner.format_ticker_data_check", lambda result: json.dumps({"ticker": result.ticker}))
+    monkeypatch.setattr(
+        "src.basket_runner.run_hedge_fund",
+        lambda **kwargs: {
+            "decisions": {
+                "AAPL": {
+                    "action": "buy",
+                    "quantity": 10,
+                    "confidence": 82,
+                    "reasoning": {"summary": "Momentum and fundamentals align"},
+                }
+            },
+            "analyst_signals": {
+                "fundamentals_analyst_agent": {"AAPL": {"signal": "bullish", "confidence": 90}},
+                "technical_analyst_agent": {"AAPL": {"signal": "bearish", "confidence": 40}},
+                "valuation_analyst_agent": {"AAPL": {"signal": "neutral", "confidence": 55}},
+            },
+        },
+    )
+
+    config = BasketRunConfig(
+        tickers=["AAPL"],
+        basket_name="large-cap",
+        model="llama3.1:latest",
+        output_dir=str(tmp_path),
+        max_symbols=None,
+        continue_on_error=True,
+        show_reasoning=False,
+        start_date=None,
+        end_date=None,
+        dry_run=False,
+        data_check_only=False,
+        analyst_preset="core",
+        analysts=["fundamentals_analyst", "technical_analyst", "valuation_analyst"],
+        request_timeout_seconds=15,
+        max_data_retries=3,
+        fast_data_mode=True,
+    )
+
+    run_dir = run_basket(config)
+
+    rows = list(csv.DictReader((run_dir / "combined_decisions.csv").open(encoding="utf-8", newline="")))
+    assert rows
+    assert list(rows[0].keys()) == DECISION_CSV_FIELDNAMES
+    assert rows[0]["ticker"] == "AAPL"
+    assert rows[0]["action"] == "buy"
+    assert rows[0]["analyst_preset"] == "core"
+    assert rows[0]["model"] == "llama3.1:latest"
+    assert rows[0]["provider"] == "Ollama"
+    assert rows[0]["data_status"] == "ok"
+    assert rows[0]["failure_classification"] == ""
+    assert rows[0]["bullish_count"] == "1"
+    assert rows[0]["bearish_count"] == "1"
+    assert rows[0]["neutral_count"] == "1"
+    assert rows[0]["run_status"] == "success"
+    assert "Momentum and fundamentals align" in rows[0]["reasoning"]
+
+    decision_summary = (run_dir / "decision_summary.md").read_text(encoding="utf-8")
+    assert DECISION_SUMMARY_DISCLAIMER in decision_summary
+    assert "| Ticker | Action | Confidence | Reasoning | Run Status |" in decision_summary
+    assert "| AAPL | buy | 82 | {\"summary\": \"Momentum and fundamentals align\"} | success |" in decision_summary
 
 
 def test_run_ticker_data_check_classifies_missing_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
