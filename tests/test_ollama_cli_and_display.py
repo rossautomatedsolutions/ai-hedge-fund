@@ -18,6 +18,7 @@ from src.basket_runner import (
     resolve_data_request_options,
     run_basket,
 )
+from src.offline_demo_data import OFFLINE_DEMO_DISCLAIMER
 from src.cli.input import resolve_model_selection, select_model
 from src.data_diagnostics import run_ticker_data_check
 from src.utils.display import print_trading_output
@@ -318,20 +319,121 @@ def test_basket_runner_combined_csv_includes_requested_columns_and_signal_counts
 
 
 def test_report_note_flags_buy_without_bullish_consensus() -> None:
+    config = BasketRunConfig(
+        tickers=["AAPL"],
+        basket_name="large-cap",
+        model="llama3.1:latest",
+        output_dir=None,
+        max_symbols=None,
+        continue_on_error=True,
+        show_reasoning=False,
+        start_date=None,
+        end_date=None,
+        dry_run=False,
+        data_check_only=False,
+        analyst_preset="core",
+        analysts=["fundamentals_analyst"],
+        request_timeout_seconds=15,
+        max_data_retries=3,
+        fast_data_mode=False,
+    )
     assert _analyst_consensus_label(0, 0, 2) == "neutral"
-    assert _report_note("buy", 0, 0, 2) == (
+    assert _report_note(config, "buy", 0, 0, 2) == (
         "Action is the final portfolio-manager output. Analyst votes shown here do not indicate a bullish consensus."
     )
     assert _analyst_consensus_label(0, 1, 1) == "mixed"
-    assert _report_note("buy", 0, 1, 1) == (
+    assert _report_note(config, "buy", 0, 1, 1) == (
         "Action is the final portfolio-manager output. Analyst votes shown here do not indicate a bullish consensus."
     )
 
 
 def test_report_note_preserves_hold_for_mixed_votes() -> None:
-    assert _report_note("hold", 0, 1, 1) == (
+    config = BasketRunConfig(
+        tickers=["AAPL"],
+        basket_name="large-cap",
+        model="llama3.1:latest",
+        output_dir=None,
+        max_symbols=None,
+        continue_on_error=True,
+        show_reasoning=False,
+        start_date=None,
+        end_date=None,
+        dry_run=False,
+        data_check_only=False,
+        analyst_preset="core",
+        analysts=["fundamentals_analyst"],
+        request_timeout_seconds=15,
+        max_data_retries=3,
+        fast_data_mode=False,
+    )
+    assert _report_note(config, "hold", 0, 1, 1) == (
         "Analyst votes are mixed; no single analyst consensus is shown in this report row."
     )
+
+
+def test_basket_runner_offline_demo_mode_writes_reports_without_financial_datasets_api_key(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("FINANCIAL_DATASETS_API_KEY", raising=False)
+    monkeypatch.setattr("src.basket_runner.ensure_ollama_and_model", lambda model, interactive=False: True)
+    monkeypatch.setattr("src.basket_runner.print_trading_output", lambda result: None)
+    monkeypatch.setattr(
+        "src.basket_runner.run_hedge_fund",
+        lambda **kwargs: {
+            "decisions": {
+                "GME": {
+                    "action": "hold",
+                    "quantity": 0,
+                    "confidence": 64,
+                    "reasoning": "Fixture-driven demo decision",
+                }
+            },
+            "analyst_signals": {
+                "fundamentals_analyst_agent": {"GME": {"signal": "neutral", "confidence": 60}},
+                "technical_analyst_agent": {"GME": {"signal": "bullish", "confidence": 66}},
+                "valuation_analyst_agent": {"GME": {"signal": "neutral", "confidence": 58}},
+            },
+        },
+    )
+
+    config = BasketRunConfig(
+        tickers=["GME"],
+        basket_name="speculative",
+        model="llama3.1:latest",
+        output_dir=str(tmp_path),
+        max_symbols=None,
+        continue_on_error=True,
+        show_reasoning=False,
+        start_date="2026-03-01",
+        end_date="2026-03-09",
+        dry_run=False,
+        data_check_only=False,
+        analyst_preset="core",
+        analysts=["fundamentals_analyst", "technical_analyst", "valuation_analyst"],
+        request_timeout_seconds=15,
+        max_data_retries=3,
+        fast_data_mode=False,
+        offline_demo_data=True,
+    )
+
+    run_dir = run_basket(config)
+
+    manifest = json.loads((run_dir / "run_manifest.json").read_text(encoding="utf-8"))
+    data_check = json.loads((run_dir / "data_check.json").read_text(encoding="utf-8"))
+    rows = list(csv.DictReader((run_dir / "combined_decisions.csv").open(encoding="utf-8", newline="")))
+    decision_summary = (run_dir / "decision_summary.md").read_text(encoding="utf-8")
+    run_summary = (run_dir / "run_summary.md").read_text(encoding="utf-8")
+
+    assert manifest["offline_demo_data"] is True
+    assert data_check[0]["classification"] == "offline_demo"
+    assert rows[0]["ticker"] == "GME"
+    assert rows[0]["data_status"] == "offline_demo"
+    assert rows[0]["run_status"] == "success"
+    assert rows[0]["reasoning"] == "Fixture-driven demo decision"
+    assert OFFLINE_DEMO_DISCLAIMER in rows[0]["report_note"]
+    assert OFFLINE_DEMO_DISCLAIMER in decision_summary
+    assert OFFLINE_DEMO_DISCLAIMER in run_summary
 
 
 def test_run_ticker_data_check_classifies_missing_api_key(monkeypatch: pytest.MonkeyPatch) -> None:

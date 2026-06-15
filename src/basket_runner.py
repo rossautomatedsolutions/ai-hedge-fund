@@ -13,10 +13,11 @@ from typing import Any
 from src.cli.input import resolve_dates
 from src.data_diagnostics import format_ticker_data_check, run_ticker_data_check, ticker_data_check_to_dict
 from src.main import run_hedge_fund
+from src.offline_demo_data import OFFLINE_DEMO_DATA_STATUS, OFFLINE_DEMO_DISCLAIMER
 from src.utils.analysts import ANALYST_ORDER
 from src.utils.display import print_trading_output
 from src.utils.ollama import ensure_ollama_and_model
-from src.tools.api import financial_data_request_settings, get_financial_data_request_settings
+from src.tools.api import financial_data_request_settings, get_financial_data_request_settings, offline_demo_data_mode
 
 
 BASKETS = {
@@ -152,6 +153,7 @@ class BasketRunConfig:
     request_timeout_seconds: int
     max_data_retries: int
     fast_data_mode: bool
+    offline_demo_data: bool = False
     model_provider: str = "Ollama"
 
 
@@ -218,6 +220,7 @@ def _write_summary(
         f"- Request timeout seconds: `{effective_request_options['request_timeout_seconds']}`",
         f"- Max data retries: `{effective_request_options['max_data_retries']}`",
         f"- Fast data mode: `{config.fast_data_mode}`",
+        f"- Offline demo data: `{config.offline_demo_data}`",
         f"- Tickers requested: `{', '.join(config.tickers)}`",
         f"- Successes: `{len(successes)}`",
         f"- Failures: `{len(failures)}`",
@@ -225,6 +228,8 @@ def _write_summary(
         f"- Data checks failed: `{len(data_check_failures)}`",
         f"- Output directory: `{run_dir.as_posix()}`",
     ]
+    if config.offline_demo_data:
+        lines.append(f"- Demo data note: {OFFLINE_DEMO_DISCLAIMER}")
     if data_checks:
         lines.extend(["", "## Data Check"])
         for check in data_checks:
@@ -301,37 +306,44 @@ def _analyst_consensus_label(bullish_count: int, bearish_count: int, neutral_cou
 
 
 def _report_note(
+    config: BasketRunConfig,
     action: Any,
     bullish_count: int,
     bearish_count: int,
     neutral_count: int,
 ) -> str:
+    notes: list[str] = []
+    if config.offline_demo_data:
+        notes.append(OFFLINE_DEMO_DISCLAIMER)
+
     normalized_action = str(action or "").strip().lower()
     consensus = _analyst_consensus_label(bullish_count, bearish_count, neutral_count)
 
     if not normalized_action:
-        return ""
+        return " ".join(notes).strip()
     if consensus == "none":
-        return "No analyst votes were captured; action reflects the final portfolio-manager output."
+        notes.append("No analyst votes were captured; action reflects the final portfolio-manager output.")
+        return " ".join(notes).strip()
     if normalized_action == "buy" and consensus != "bullish":
-        return (
-            "Action is the final portfolio-manager output. Analyst votes shown here do not indicate a bullish consensus."
-        )
+        notes.append("Action is the final portfolio-manager output. Analyst votes shown here do not indicate a bullish consensus.")
+        return " ".join(notes).strip()
     if normalized_action in {"sell", "short"} and consensus != "bearish":
-        return (
-            "Action is the final portfolio-manager output. Analyst votes shown here do not indicate a bearish consensus."
-        )
+        notes.append("Action is the final portfolio-manager output. Analyst votes shown here do not indicate a bearish consensus.")
+        return " ".join(notes).strip()
     if normalized_action in {"hold", "cover"} and consensus == "mixed":
-        return "Analyst votes are mixed; no single analyst consensus is shown in this report row."
-    return ""
+        notes.append("Analyst votes are mixed; no single analyst consensus is shown in this report row.")
+        return " ".join(notes).strip()
+    return " ".join(notes).strip()
 
 
 def _data_status(check: dict[str, Any] | None) -> str:
     if not check:
         return ""
+    classification = check.get("classification")
+    if classification in {OFFLINE_DEMO_DATA_STATUS, "fixture_data"}:
+        return str(classification)
     if check.get("ok"):
         return "ok"
-    classification = check.get("classification")
     return str(classification) if classification else "failed"
 
 
@@ -353,7 +365,7 @@ def _flatten_decision(
         "reasoning": _stringify_reasoning(decision.get("reasoning", "")),
         "analyst_vote_summary": _analyst_vote_summary(bullish_count, bearish_count, neutral_count),
         "analyst_consensus": _analyst_consensus_label(bullish_count, bearish_count, neutral_count),
-        "report_note": _report_note(action, bullish_count, bearish_count, neutral_count),
+        "report_note": _report_note(config, action, bullish_count, bearish_count, neutral_count),
         "analyst_preset": config.analyst_preset,
         "model": config.model,
         "provider": config.model_provider,
@@ -387,7 +399,7 @@ def _failure_row(
         "reasoning": reasoning,
         "analyst_vote_summary": _analyst_vote_summary(0, 0, 0),
         "analyst_consensus": "none",
-        "report_note": "",
+        "report_note": OFFLINE_DEMO_DISCLAIMER if config.offline_demo_data else "",
         "analyst_preset": config.analyst_preset,
         "model": config.model,
         "provider": config.model_provider,
@@ -410,16 +422,30 @@ def _write_decisions_csv(path: Path, rows: list[dict[str, Any]]) -> None:
 
 
 def _write_decision_summary(path: Path, rows: list[dict[str, Any]]) -> None:
+    uses_offline_demo = any(
+        str(row.get("data_status") or "").strip() in {OFFLINE_DEMO_DATA_STATUS, "fixture_data"} for row in rows
+    )
     lines = [
         "# Decision Summary",
         "",
         DECISION_SUMMARY_DISCLAIMER,
         "",
-        "Action is the final portfolio-manager output. Analyst votes are shown separately and are not simple majority-vote trading logic.",
-        "",
-        "| Ticker | Action | Confidence | Analyst Votes | Analyst Consensus | Reasoning | Run Status | Notes |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
+    if uses_offline_demo:
+        lines.extend(
+            [
+                f"Offline/demo data note: {OFFLINE_DEMO_DISCLAIMER}",
+                "",
+            ]
+        )
+    lines.extend(
+        [
+            "Action is the final portfolio-manager output. Analyst votes are shown separately and are not simple majority-vote trading logic.",
+            "",
+            "| Ticker | Action | Confidence | Analyst Votes | Analyst Consensus | Reasoning | Run Status | Notes |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- |",
+        ]
+    )
     for row in rows:
         action = str(row.get("action") or "").strip() or "FAILED"
         confidence = str(row.get("confidence") or "").strip()
@@ -477,6 +503,7 @@ def run_basket(config: BasketRunConfig) -> Path:
         "request_timeout_seconds": request_options["request_timeout_seconds"],
         "max_data_retries": request_options["max_data_retries"],
         "fast_data_mode": config.fast_data_mode,
+        "offline_demo_data": config.offline_demo_data,
         "skip_optional_slow_data": request_options["skip_optional_slow_data"],
     }
     _write_json(run_dir / "run_manifest.json", manifest)
@@ -506,30 +533,61 @@ def run_basket(config: BasketRunConfig) -> Path:
     )
 
     try:
-        with financial_data_request_settings(
-            timeout_seconds=request_options["request_timeout_seconds"],
-            max_attempts=request_options["max_data_retries"] + 1,
-            skip_optional_slow_data=request_options["skip_optional_slow_data"],
-        ):
-            active_settings = get_financial_data_request_settings()
-            for ticker in config.tickers:
-                print(f"[ticker:{ticker}] starting data check | log={logs_dir / f'{ticker}.data_check.log'}")
-                data_check_result = run_ticker_data_check(ticker, start_date, end_date)
-                data_check_payload = ticker_data_check_to_dict(data_check_result)
-                data_checks.append(data_check_payload)
-                (logs_dir / f"{ticker}.data_check.log").write_text(format_ticker_data_check(data_check_result) + "\n", encoding="utf-8")
+        with offline_demo_data_mode(enabled=config.offline_demo_data):
+            with financial_data_request_settings(
+                timeout_seconds=request_options["request_timeout_seconds"],
+                max_attempts=request_options["max_data_retries"] + 1,
+                skip_optional_slow_data=request_options["skip_optional_slow_data"],
+            ):
+                active_settings = get_financial_data_request_settings()
+                for ticker in config.tickers:
+                    print(f"[ticker:{ticker}] starting data check | log={logs_dir / f'{ticker}.data_check.log'}")
+                    data_check_result = run_ticker_data_check(ticker, start_date, end_date)
+                    data_check_payload = ticker_data_check_to_dict(data_check_result)
+                    data_checks.append(data_check_payload)
+                    (logs_dir / f"{ticker}.data_check.log").write_text(
+                        format_ticker_data_check(data_check_result) + "\n",
+                        encoding="utf-8",
+                    )
 
-                if config.data_check_only:
-                    print(f"[ticker:{ticker}] data-check-only complete with classification={data_check_result.classification}")
-                    (logs_dir / f"{ticker}.log").write_text(format_ticker_data_check(data_check_result) + "\n", encoding="utf-8")
-                    if data_check_result.ok:
-                        successes.append({"ticker": ticker, "mode": "data-check-only"})
-                    else:
+                    if config.data_check_only:
+                        print(f"[ticker:{ticker}] data-check-only complete with classification={data_check_result.classification}")
+                        (logs_dir / f"{ticker}.log").write_text(format_ticker_data_check(data_check_result) + "\n", encoding="utf-8")
+                        if data_check_result.ok:
+                            successes.append({"ticker": ticker, "mode": "data-check-only"})
+                        else:
+                            failure_payload = {
+                                "ticker": ticker,
+                                "classification": data_check_result.classification,
+                                "diagnosis": data_check_result.diagnosis,
+                                "error": data_check_result.diagnosis,
+                            }
+                            failures.append(failure_payload)
+                            decision_rows.append(
+                                _failure_row(
+                                    ticker,
+                                    config=config,
+                                    failure=failure_payload,
+                                    data_check=data_check_payload,
+                                )
+                            )
+                        continue
+
+                    if not data_check_result.ok:
+                        message = f"Data check failed before LLM run: {data_check_result.diagnosis}"
+                        print(f"[ticker:{ticker}] stopping before live run: {message}")
+                        combined_logs.append(
+                            f"===== {ticker} =====\n{format_ticker_data_check(data_check_result)}\nERROR: {message}\n"
+                        )
+                        (logs_dir / f"{ticker}.log").write_text(
+                            f"{format_ticker_data_check(data_check_result)}\nERROR: {message}\n",
+                            encoding="utf-8",
+                        )
                         failure_payload = {
                             "ticker": ticker,
                             "classification": data_check_result.classification,
                             "diagnosis": data_check_result.diagnosis,
-                            "error": data_check_result.diagnosis,
+                            "error": message,
                         }
                         failures.append(failure_payload)
                         decision_rows.append(
@@ -540,82 +598,60 @@ def run_basket(config: BasketRunConfig) -> Path:
                                 data_check=data_check_payload,
                             )
                         )
-                    continue
+                        if not config.continue_on_error:
+                            break
+                        continue
 
-                if not data_check_result.ok:
-                    message = f"Data check failed before LLM run: {data_check_result.diagnosis}"
-                    print(f"[ticker:{ticker}] stopping before live run: {message}")
-                    combined_logs.append(f"===== {ticker} =====\n{format_ticker_data_check(data_check_result)}\nERROR: {message}\n")
-                    (logs_dir / f"{ticker}.log").write_text(f"{format_ticker_data_check(data_check_result)}\nERROR: {message}\n", encoding="utf-8")
-                    failure_payload = {
-                        "ticker": ticker,
-                        "classification": data_check_result.classification,
-                        "diagnosis": data_check_result.diagnosis,
-                        "error": message,
-                    }
-                    failures.append(failure_payload)
-                    decision_rows.append(
-                        _failure_row(
-                            ticker,
-                            config=config,
-                            failure=failure_payload,
-                            data_check=data_check_payload,
-                        )
+                    print(
+                        f"[ticker:{ticker}] starting live run | analysts={','.join(config.analysts)} | "
+                        f"timeout={active_settings.timeout_seconds}s | attempts={active_settings.max_attempts} | "
+                        f"skip_optional_slow_data={active_settings.skip_optional_slow_data}"
                     )
-                    if not config.continue_on_error:
-                        break
-                    continue
-
-                print(
-                    f"[ticker:{ticker}] starting live run | analysts={','.join(config.analysts)} | "
-                    f"timeout={active_settings.timeout_seconds}s | attempts={active_settings.max_attempts} | "
-                    f"skip_optional_slow_data={active_settings.skip_optional_slow_data}"
-                )
-                buffer = io.StringIO()
-                try:
-                    with redirect_stdout(buffer):
-                        result = run_hedge_fund(
-                            tickers=[ticker],
-                            start_date=start_date,
-                            end_date=end_date,
-                            portfolio=_portfolio_for_ticker(ticker),
-                            show_reasoning=config.show_reasoning,
-                            selected_analysts=config.analysts,
-                            model_name=config.model,
-                            model_provider=config.model_provider,
+                    buffer = io.StringIO()
+                    try:
+                        with redirect_stdout(buffer):
+                            result = run_hedge_fund(
+                                tickers=[ticker],
+                                start_date=start_date,
+                                end_date=end_date,
+                                portfolio=_portfolio_for_ticker(ticker),
+                                show_reasoning=config.show_reasoning,
+                                selected_analysts=config.analysts,
+                                model_name=config.model,
+                                model_provider=config.model_provider,
+                            )
+                            print_trading_output(result)
+                        log_output = buffer.getvalue()
+                        full_log_output = f"{format_ticker_data_check(data_check_result)}\n\n{log_output}"
+                        combined_logs.append(f"===== {ticker} =====\n{full_log_output}")
+                        (logs_dir / f"{ticker}.log").write_text(full_log_output, encoding="utf-8")
+                        print(f"[ticker:{ticker}] completed successfully | log={logs_dir / f'{ticker}.log'}")
+                        successes.append({"ticker": ticker})
+                        decision_rows.append(_flatten_decision(ticker, result, config=config, data_check=data_check_payload))
+                    except Exception as exc:
+                        log_output = buffer.getvalue()
+                        full_log_output = f"{format_ticker_data_check(data_check_result)}\n\n{log_output}\nERROR: {exc}\n"
+                        combined_logs.append(f"===== {ticker} =====\n{full_log_output}")
+                        (logs_dir / f"{ticker}.log").write_text(full_log_output, encoding="utf-8")
+                        classification, diagnosis = _classify_run_exception(exc)
+                        print(f"[ticker:{ticker}] failed with {classification}: {diagnosis}")
+                        failure_payload = {
+                            "ticker": ticker,
+                            "classification": classification,
+                            "diagnosis": diagnosis,
+                            "error": str(exc),
+                        }
+                        failures.append(failure_payload)
+                        decision_rows.append(
+                            _failure_row(
+                                ticker,
+                                config=config,
+                                failure=failure_payload,
+                                data_check=data_check_payload,
+                            )
                         )
-                        print_trading_output(result)
-                    log_output = buffer.getvalue()
-                    full_log_output = f"{format_ticker_data_check(data_check_result)}\n\n{log_output}"
-                    combined_logs.append(f"===== {ticker} =====\n{full_log_output}")
-                    (logs_dir / f"{ticker}.log").write_text(full_log_output, encoding="utf-8")
-                    print(f"[ticker:{ticker}] completed successfully | log={logs_dir / f'{ticker}.log'}")
-                    successes.append({"ticker": ticker})
-                    decision_rows.append(_flatten_decision(ticker, result, config=config, data_check=data_check_payload))
-                except Exception as exc:
-                    log_output = buffer.getvalue()
-                    full_log_output = f"{format_ticker_data_check(data_check_result)}\n\n{log_output}\nERROR: {exc}\n"
-                    combined_logs.append(f"===== {ticker} =====\n{full_log_output}")
-                    (logs_dir / f"{ticker}.log").write_text(full_log_output, encoding="utf-8")
-                    classification, diagnosis = _classify_run_exception(exc)
-                    print(f"[ticker:{ticker}] failed with {classification}: {diagnosis}")
-                    failure_payload = {
-                        "ticker": ticker,
-                        "classification": classification,
-                        "diagnosis": diagnosis,
-                        "error": str(exc),
-                    }
-                    failures.append(failure_payload)
-                    decision_rows.append(
-                        _failure_row(
-                            ticker,
-                            config=config,
-                            failure=failure_payload,
-                            data_check=data_check_payload,
-                        )
-                    )
-                    if not config.continue_on_error:
-                        break
+                        if not config.continue_on_error:
+                            break
     except KeyboardInterrupt:
         print("Keyboard interrupt received. Writing partial basket artifacts before exit.")
         failures.append(
@@ -653,6 +689,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--request-timeout-seconds", type=int, default=15)
     parser.add_argument("--max-data-retries", type=int, default=3)
     parser.add_argument("--fast-data-mode", "--low-latency-data-mode", dest="fast_data_mode", action="store_true")
+    parser.add_argument(
+        "--offline-demo-data",
+        "--demo-data-mode",
+        dest="offline_demo_data",
+        action="store_true",
+        help="Use static local fixture data for educational/demo runs without live financial-data API access.",
+    )
     return parser
 
 
@@ -681,10 +724,21 @@ def main() -> int:
         request_timeout_seconds=args.request_timeout_seconds,
         max_data_retries=args.max_data_retries,
         fast_data_mode=args.fast_data_mode,
+        offline_demo_data=args.offline_demo_data,
     )
 
     run_dir = run_basket(config)
-    print(json.dumps({"run_dir": run_dir.as_posix(), "dry_run": config.dry_run, "data_check_only": config.data_check_only}, indent=2))
+    print(
+        json.dumps(
+            {
+                "run_dir": run_dir.as_posix(),
+                "dry_run": config.dry_run,
+                "data_check_only": config.data_check_only,
+                "offline_demo_data": config.offline_demo_data,
+            },
+            indent=2,
+        )
+    )
     return 0
 
 

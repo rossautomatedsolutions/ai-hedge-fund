@@ -14,6 +14,13 @@ from src.tools.api import (
     build_financial_datasets_headers,
     get_financial_datasets_api_key,
     get_financial_datasets_request_specs,
+    is_offline_demo_data_mode_enabled,
+)
+from src.offline_demo_data import (
+    OFFLINE_DEMO_DATA_STATUS,
+    OFFLINE_DEMO_DISCLAIMER,
+    OFFLINE_DEMO_SUPPORTED_TICKERS,
+    has_offline_demo_fixture,
 )
 
 
@@ -26,6 +33,7 @@ FAILURE_TYPES = {
     "timeout",
     "missing_data",
     "partial_data",
+    "fixture_data_unavailable",
     "unknown_error",
 }
 
@@ -199,6 +207,34 @@ def _run_request_check(spec: FinancialDatasetsRequestSpec, *, api_key: str | Non
 
 
 def run_ticker_data_check(ticker: str, start_date: str, end_date: str, *, api_key: str | None = None) -> TickerDataCheckResult:
+    normalized_ticker = ticker.upper()
+    if is_offline_demo_data_mode_enabled():
+        if has_offline_demo_fixture(normalized_ticker):
+            return TickerDataCheckResult(
+                ticker=normalized_ticker,
+                ok=True,
+                partial_ok=False,
+                classification=OFFLINE_DEMO_DATA_STATUS,
+                diagnosis=OFFLINE_DEMO_DISCLAIMER,
+                env_var=FINANCIAL_DATASETS_API_KEY_ENV_VAR,
+                checked_at=datetime.now().isoformat(),
+                checks=[],
+            )
+        supported = ", ".join(OFFLINE_DEMO_SUPPORTED_TICKERS)
+        return TickerDataCheckResult(
+            ticker=normalized_ticker,
+            ok=False,
+            partial_ok=False,
+            classification="fixture_data_unavailable",
+            diagnosis=(
+                f"Offline demo data is only available for {supported}. "
+                f"No local fixture exists for {normalized_ticker}."
+            ),
+            env_var=FINANCIAL_DATASETS_API_KEY_ENV_VAR,
+            checked_at=datetime.now().isoformat(),
+            checks=[],
+        )
+
     specs = get_financial_datasets_request_specs(ticker, start_date, end_date)
     checks = [_run_request_check(spec, api_key=api_key) for spec in specs]
     successes = [check for check in checks if check.ok]
