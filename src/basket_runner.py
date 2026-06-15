@@ -66,6 +66,9 @@ DECISION_CSV_FIELDNAMES = [
     "quantity",
     "confidence",
     "reasoning",
+    "analyst_vote_summary",
+    "analyst_consensus",
+    "report_note",
     "analyst_preset",
     "model",
     "provider",
@@ -278,6 +281,51 @@ def _signal_counts(result: dict[str, Any], ticker: str) -> tuple[int, int, int]:
     return (bullish_count, bearish_count, neutral_count)
 
 
+def _analyst_vote_summary(bullish_count: int, bearish_count: int, neutral_count: int) -> str:
+    return f"bullish={bullish_count}, bearish={bearish_count}, neutral={neutral_count}"
+
+
+def _analyst_consensus_label(bullish_count: int, bearish_count: int, neutral_count: int) -> str:
+    counts = {
+        "bullish": bullish_count,
+        "bearish": bearish_count,
+        "neutral": neutral_count,
+    }
+    max_count = max(counts.values())
+    if max_count <= 0:
+        return "none"
+    leaders = [label for label, count in counts.items() if count == max_count]
+    if len(leaders) > 1:
+        return "mixed"
+    return leaders[0]
+
+
+def _report_note(
+    action: Any,
+    bullish_count: int,
+    bearish_count: int,
+    neutral_count: int,
+) -> str:
+    normalized_action = str(action or "").strip().lower()
+    consensus = _analyst_consensus_label(bullish_count, bearish_count, neutral_count)
+
+    if not normalized_action:
+        return ""
+    if consensus == "none":
+        return "No analyst votes were captured; action reflects the final portfolio-manager output."
+    if normalized_action == "buy" and consensus != "bullish":
+        return (
+            "Action is the final portfolio-manager output. Analyst votes shown here do not indicate a bullish consensus."
+        )
+    if normalized_action in {"sell", "short"} and consensus != "bearish":
+        return (
+            "Action is the final portfolio-manager output. Analyst votes shown here do not indicate a bearish consensus."
+        )
+    if normalized_action in {"hold", "cover"} and consensus == "mixed":
+        return "Analyst votes are mixed; no single analyst consensus is shown in this report row."
+    return ""
+
+
 def _data_status(check: dict[str, Any] | None) -> str:
     if not check:
         return ""
@@ -296,12 +344,16 @@ def _flatten_decision(
 ) -> dict[str, Any]:
     decision = (result.get("decisions") or {}).get(ticker) or {}
     bullish_count, bearish_count, neutral_count = _signal_counts(result, ticker)
+    action = decision.get("action", "UNKNOWN")
     return {
         "ticker": ticker,
-        "action": decision.get("action", "UNKNOWN"),
+        "action": action,
         "quantity": decision.get("quantity", ""),
         "confidence": decision.get("confidence", ""),
         "reasoning": _stringify_reasoning(decision.get("reasoning", "")),
+        "analyst_vote_summary": _analyst_vote_summary(bullish_count, bearish_count, neutral_count),
+        "analyst_consensus": _analyst_consensus_label(bullish_count, bearish_count, neutral_count),
+        "report_note": _report_note(action, bullish_count, bearish_count, neutral_count),
         "analyst_preset": config.analyst_preset,
         "model": config.model,
         "provider": config.model_provider,
@@ -333,6 +385,9 @@ def _failure_row(
         "quantity": "",
         "confidence": "",
         "reasoning": reasoning,
+        "analyst_vote_summary": _analyst_vote_summary(0, 0, 0),
+        "analyst_consensus": "none",
+        "report_note": "",
         "analyst_preset": config.analyst_preset,
         "model": config.model,
         "provider": config.model_provider,
@@ -360,16 +415,22 @@ def _write_decision_summary(path: Path, rows: list[dict[str, Any]]) -> None:
         "",
         DECISION_SUMMARY_DISCLAIMER,
         "",
-        "| Ticker | Action | Confidence | Reasoning | Run Status |",
-        "| --- | --- | --- | --- | --- |",
+        "Action is the final portfolio-manager output. Analyst votes are shown separately and are not simple majority-vote trading logic.",
+        "",
+        "| Ticker | Action | Confidence | Analyst Votes | Analyst Consensus | Reasoning | Run Status | Notes |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for row in rows:
         action = str(row.get("action") or "").strip() or "FAILED"
         confidence = str(row.get("confidence") or "").strip()
         reasoning = str(row.get("reasoning") or "").replace("\n", " ").replace("|", "\\|").strip()
+        analyst_votes = str(row.get("analyst_vote_summary") or "").replace("|", "\\|").strip()
+        analyst_consensus = str(row.get("analyst_consensus") or "").replace("|", "\\|").strip()
         run_status = str(row.get("run_status") or "").strip() or "unknown"
+        notes = str(row.get("report_note") or "").replace("\n", " ").replace("|", "\\|").strip()
         lines.append(
-            f"| {row.get('ticker', '')} | {action} | {confidence} | {reasoning} | {run_status} |"
+            f"| {row.get('ticker', '')} | {action} | {confidence} | {analyst_votes} | "
+            f"{analyst_consensus} | {reasoning} | {run_status} | {notes} |"
         )
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 

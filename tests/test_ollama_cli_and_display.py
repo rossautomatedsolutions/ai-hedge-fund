@@ -12,6 +12,8 @@ from src.basket_runner import (
     DECISION_CSV_FIELDNAMES,
     DECISION_SUMMARY_DISCLAIMER,
     BasketRunConfig,
+    _analyst_consensus_label,
+    _report_note,
     resolve_analysts_for_preset,
     resolve_data_request_options,
     run_basket,
@@ -204,11 +206,13 @@ def test_basket_runner_continue_on_error_writes_failures(tmp_path: Path, monkeyp
     assert [row["ticker"] for row in combined_csv] == ["BB", "GME"]
     assert combined_csv[0]["run_status"] == "failed"
     assert combined_csv[0]["failure_classification"] == "unknown_error"
+    assert combined_csv[0]["analyst_consensus"] == "none"
     assert combined_csv[1]["run_status"] == "success"
     assert "Decision Summary" in decision_summary
     assert DECISION_SUMMARY_DISCLAIMER in decision_summary
+    assert "Action is the final portfolio-manager output." in decision_summary
     assert "| BB | FAILED |" in decision_summary
-    assert "| GME | hold | 50 | ok | success |" in decision_summary
+    assert "| GME | hold | 50 | bullish=0, bearish=0, neutral=0 | none | ok | success |" in decision_summary
 
 
 def test_basket_runner_combined_csv_includes_requested_columns_and_signal_counts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -296,13 +300,38 @@ def test_basket_runner_combined_csv_includes_requested_columns_and_signal_counts
     assert rows[0]["bullish_count"] == "1"
     assert rows[0]["bearish_count"] == "1"
     assert rows[0]["neutral_count"] == "1"
+    assert rows[0]["analyst_vote_summary"] == "bullish=1, bearish=1, neutral=1"
+    assert rows[0]["analyst_consensus"] == "mixed"
+    assert rows[0]["report_note"] == "Action is the final portfolio-manager output. Analyst votes shown here do not indicate a bullish consensus."
     assert rows[0]["run_status"] == "success"
     assert "Momentum and fundamentals align" in rows[0]["reasoning"]
 
     decision_summary = (run_dir / "decision_summary.md").read_text(encoding="utf-8")
     assert DECISION_SUMMARY_DISCLAIMER in decision_summary
-    assert "| Ticker | Action | Confidence | Reasoning | Run Status |" in decision_summary
-    assert "| AAPL | buy | 82 | {\"summary\": \"Momentum and fundamentals align\"} | success |" in decision_summary
+    assert "Action is the final portfolio-manager output." in decision_summary
+    assert "| Ticker | Action | Confidence | Analyst Votes | Analyst Consensus | Reasoning | Run Status | Notes |" in decision_summary
+    assert (
+        "| AAPL | buy | 82 | bullish=1, bearish=1, neutral=1 | mixed | "
+        "{\"summary\": \"Momentum and fundamentals align\"} | success | "
+        "Action is the final portfolio-manager output. Analyst votes shown here do not indicate a bullish consensus. |"
+    ) in decision_summary
+
+
+def test_report_note_flags_buy_without_bullish_consensus() -> None:
+    assert _analyst_consensus_label(0, 0, 2) == "neutral"
+    assert _report_note("buy", 0, 0, 2) == (
+        "Action is the final portfolio-manager output. Analyst votes shown here do not indicate a bullish consensus."
+    )
+    assert _analyst_consensus_label(0, 1, 1) == "mixed"
+    assert _report_note("buy", 0, 1, 1) == (
+        "Action is the final portfolio-manager output. Analyst votes shown here do not indicate a bullish consensus."
+    )
+
+
+def test_report_note_preserves_hold_for_mixed_votes() -> None:
+    assert _report_note("hold", 0, 1, 1) == (
+        "Analyst votes are mixed; no single analyst consensus is shown in this report row."
+    )
 
 
 def test_run_ticker_data_check_classifies_missing_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
