@@ -33,3 +33,4 @@
     {"ticker": "MSFT", "issuer": "Microsoft Corporation", "name": "Demo Executive", "title": "EVP", "is_board_director": false, "transaction_date": "2026-01-15", "transaction_shares": -4000.0, "transaction_price_per_share": 421.0, "transaction_value": -1684000.0, "shares_owned_before_transaction": 101000.0, "shares_owned_after_transaction": 97000.0, "security_title": "Common Stock", "filing_date": "2026-01-16"},
     {"ticker": "MSFT", "issuer": "Microsoft Corporation", "name": "Demo Director", "title": "Director", "is_board_director": true, "transaction_date": "2025-12-10", "transaction_shares": 3500.0, "transaction_price_per_share": 415.0, "transaction_value": 1452500.0, "shares_owned_before_transaction": 22000.0, "shares_owned_after_transaction": 25500.0, "security_title": "Common Stock", "filing_date": "2025-12-11"}
   ]
+}

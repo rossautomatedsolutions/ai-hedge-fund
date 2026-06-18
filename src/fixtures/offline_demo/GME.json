@@ -33,3 +33,4 @@
     {"ticker": "GME", "issuer": "GameStop Corp.", "name": "Demo Officer", "title": "Officer", "is_board_director": false, "transaction_date": "2026-01-09", "transaction_shares": -12000.0, "transaction_price_per_share": 23.5, "transaction_value": -282000.0, "shares_owned_before_transaction": 42000.0, "shares_owned_after_transaction": 30000.0, "security_title": "Class A Common Stock", "filing_date": "2026-01-10"},
     {"ticker": "GME", "issuer": "GameStop Corp.", "name": "Demo Officer", "title": "Officer", "is_board_director": false, "transaction_date": "2025-12-05", "transaction_shares": 6000.0, "transaction_price_per_share": 22.4, "transaction_value": 134400.0, "shares_owned_before_transaction": 24000.0, "shares_owned_after_transaction": 30000.0, "security_title": "Class A Common Stock", "filing_date": "2025-12-06"}
   ]
+}

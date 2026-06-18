@@ -21,6 +21,14 @@ from src.basket_runner import (
 from src.offline_demo_data import OFFLINE_DEMO_DISCLAIMER
 from src.cli.input import resolve_model_selection, select_model
 from src.data_diagnostics import run_ticker_data_check
+from src.tools.api import (
+    get_company_news,
+    get_financial_metrics,
+    get_insider_trades,
+    get_market_cap,
+    get_prices,
+    search_line_items,
+)
 from src.utils.display import print_trading_output
 
 
@@ -434,6 +442,112 @@ def test_basket_runner_offline_demo_mode_writes_reports_without_financial_datase
     assert OFFLINE_DEMO_DISCLAIMER in rows[0]["report_note"]
     assert OFFLINE_DEMO_DISCLAIMER in decision_summary
     assert OFFLINE_DEMO_DISCLAIMER in run_summary
+
+
+def test_basket_runner_offline_demo_mode_exercises_fixture_backed_api_helpers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("FINANCIAL_DATASETS_API_KEY", raising=False)
+    monkeypatch.setattr("src.basket_runner.ensure_ollama_and_model", lambda model, interactive=False: True)
+    monkeypatch.setattr("src.basket_runner.print_trading_output", lambda result: None)
+
+    def fake_run_hedge_fund(**kwargs):
+        ticker = kwargs["tickers"][0]
+        start_date = kwargs["start_date"]
+        end_date = kwargs["end_date"]
+
+        prices = get_prices(ticker, start_date, end_date)
+        metrics = get_financial_metrics(ticker, end_date, limit=5)
+        line_items = search_line_items(
+            ticker,
+            ["revenue", "net_income", "free_cash_flow", "outstanding_shares"],
+            end_date,
+            limit=5,
+        )
+        news = get_company_news(ticker, end_date, start_date=start_date, limit=5)
+        trades = get_insider_trades(ticker, end_date, start_date=start_date, limit=5)
+        market_cap = get_market_cap(ticker, end_date)
+
+        assert prices
+        assert metrics
+        assert line_items
+        assert news
+        assert trades
+        assert market_cap is not None
+        assert getattr(line_items[0], "working_capital", None) is not None
+
+        latest_price = prices[-1].close
+        latest_metric = metrics[0]
+        latest_line_item = line_items[0]
+        reasoning = (
+            f"Offline demo fixture loaded for {ticker}: "
+            f"close={latest_price}, revenue={getattr(latest_line_item, 'revenue', None)}, "
+            f"market_cap={market_cap}, gross_margin={latest_metric.gross_margin}"
+        )
+
+        return {
+            "decisions": {
+                ticker: {
+                    "action": "hold",
+                    "quantity": 0,
+                    "confidence": 61,
+                    "reasoning": reasoning,
+                }
+            },
+            "analyst_signals": {
+                "fundamentals_analyst_agent": {ticker: {"signal": "neutral", "confidence": 60}},
+                "technical_analyst_agent": {ticker: {"signal": "bullish", "confidence": 62}},
+                "valuation_analyst_agent": {ticker: {"signal": "neutral", "confidence": 59}},
+            },
+        }
+
+    monkeypatch.setattr("src.basket_runner.run_hedge_fund", fake_run_hedge_fund)
+
+    config = BasketRunConfig(
+        tickers=["BB", "GME", "AAPL", "MSFT", "NVDA"],
+        basket_name="large-cap",
+        model="llama3.1:latest",
+        output_dir=str(tmp_path),
+        max_symbols=None,
+        continue_on_error=True,
+        show_reasoning=False,
+        start_date="2026-03-01",
+        end_date="2026-03-09",
+        dry_run=False,
+        data_check_only=False,
+        analyst_preset="core",
+        analysts=["fundamentals_analyst", "technical_analyst", "valuation_analyst"],
+        request_timeout_seconds=15,
+        max_data_retries=3,
+        fast_data_mode=True,
+        offline_demo_data=True,
+    )
+
+    run_dir = run_basket(config)
+
+    rows = list(csv.DictReader((run_dir / "combined_decisions.csv").open(encoding="utf-8", newline="")))
+    summary = (run_dir / "decision_summary.md").read_text(encoding="utf-8")
+
+    assert [row["ticker"] for row in rows] == ["BB", "GME", "AAPL", "MSFT", "NVDA"]
+    assert all(row["run_status"] == "success" for row in rows)
+    assert all(row["data_status"] == "offline_demo" for row in rows)
+    assert all("Offline demo fixture loaded" in row["reasoning"] for row in rows)
+    assert OFFLINE_DEMO_DISCLAIMER in summary
+
+
+def test_run_ticker_data_check_accepts_bb_offline_demo_fixture(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("FINANCIAL_DATASETS_API_KEY", raising=False)
+
+    from src.tools.api import offline_demo_data_mode
+
+    with offline_demo_data_mode(enabled=True):
+        result = run_ticker_data_check("BB", "2026-03-01", "2026-03-09")
+
+    assert result.ok is True
+    assert result.partial_ok is False
+    assert result.classification == "offline_demo"
+    assert result.checks == []
 
 
 def test_run_ticker_data_check_classifies_missing_api_key(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -33,3 +33,4 @@
     {"ticker": "NVDA", "issuer": "NVIDIA Corporation", "name": "Demo Executive", "title": "EVP", "is_board_director": false, "transaction_date": "2026-01-28", "transaction_shares": -3000.0, "transaction_price_per_share": 138.0, "transaction_value": -414000.0, "shares_owned_before_transaction": 66000.0, "shares_owned_after_transaction": 63000.0, "security_title": "Common Stock", "filing_date": "2026-01-29"},
     {"ticker": "NVDA", "issuer": "NVIDIA Corporation", "name": "Demo Director", "title": "Director", "is_board_director": true, "transaction_date": "2025-12-18", "transaction_shares": 2500.0, "transaction_price_per_share": 131.0, "transaction_value": 327500.0, "shares_owned_before_transaction": 17000.0, "shares_owned_after_transaction": 19500.0, "security_title": "Common Stock", "filing_date": "2025-12-19"}
   ]
+}
