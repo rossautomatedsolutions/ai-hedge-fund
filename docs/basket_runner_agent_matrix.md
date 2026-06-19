@@ -55,3 +55,7 @@ Notes:
 - Without `FINANCIAL_DATASETS_API_KEY`, the common outcomes are:
   `missing_api_key`, `unauthorized_401`, or `partial_data`.
 - The only exception is if the provider returns public `200` responses for all required base endpoints for that ticker/date range; the tests cover that as a possible but non-default path.
+
+## Recent Validation
+
+- On June 18, 2026, `BB` completed successfully in offline demo mode with `--analyst-preset all`, producing `data_status=offline_demo` and a successful decision row.

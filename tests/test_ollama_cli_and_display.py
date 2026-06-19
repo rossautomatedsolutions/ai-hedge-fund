@@ -772,6 +772,17 @@ def test_resolve_analysts_for_preset_core() -> None:
     ]
 
 
+def test_resolve_analysts_for_preset_all_includes_full_analyst_order() -> None:
+    analysts = resolve_analysts_for_preset("all")
+    assert "fundamentals_analyst" in analysts
+    assert "technical_analyst" in analysts
+    assert "valuation_analyst" in analysts
+    assert "news_sentiment_analyst" in analysts
+    assert "sentiment_analyst" in analysts
+    assert "aswath_damodaran" in analysts
+    assert len(analysts) == 19
+
+
 def test_resolve_analysts_for_preset_no_news_excludes_news_analysts() -> None:
     analysts = resolve_analysts_for_preset("no-news")
     assert "news_sentiment_analyst" not in analysts
