@@ -69,6 +69,7 @@ PRESET_COMPARISON_CSV_FIELDNAMES = [
     "confidence",
     "analyst_vote_summary",
     "analyst_consensus",
+    "comparison_note",
     "reasoning",
     "data_status",
     "run_status",
@@ -380,6 +381,55 @@ def _report_note(
     return " ".join(notes).strip()
 
 
+def _is_directional_action(action: str) -> bool:
+    return action in {"buy", "sell", "short"}
+
+
+def _comparison_note(
+    action: Any,
+    consensus: Any,
+    bullish_count: Any,
+    bearish_count: Any,
+    neutral_count: Any,
+    reasoning: Any,
+) -> str:
+    notes: list[str] = []
+    normalized_action = str(action or "").strip().lower()
+    normalized_consensus = str(consensus or "").strip().lower()
+    normalized_reasoning = _stringify_reasoning(reasoning).lower()
+
+    if not normalized_action or normalized_action in {"hold", "cover"} or normalized_consensus in {"", "none"}:
+        return ""
+
+    if _is_directional_action(normalized_action) and normalized_consensus != "mixed":
+        if (
+            (normalized_action == "buy" and normalized_consensus != "bullish")
+            or (normalized_action in {"sell", "short"} and normalized_consensus != "bearish")
+        ):
+            notes.append("Final portfolio-manager action differs from analyst vote consensus.")
+
+    if normalized_action == "buy" and normalized_consensus == "bearish":
+        notes.append("Buy action is portfolio-manager output despite bearish analyst vote consensus.")
+    elif normalized_action in {"sell", "short"} and normalized_consensus == "bullish":
+        notes.append(f"{normalized_action.capitalize()} action is portfolio-manager output despite bullish analyst vote consensus.")
+    elif _is_directional_action(normalized_action) and normalized_consensus == "mixed":
+        notes.append("Action is directional despite mixed analyst votes.")
+
+    try:
+        bullish = int(bullish_count)
+        bearish = int(bearish_count)
+        neutral = int(neutral_count)
+    except (TypeError, ValueError):
+        bullish = bearish = neutral = 0
+
+    if "majority bullish" in normalized_reasoning and bullish < max(bearish, neutral):
+        notes.append("Reasoning should be read as portfolio-manager rationale, not analyst vote majority.")
+    if "majority bearish" in normalized_reasoning and bearish < max(bullish, neutral):
+        notes.append("Reasoning should be read as portfolio-manager rationale, not analyst vote majority.")
+
+    return " ".join(notes).strip()
+
+
 def _data_status(check: dict[str, Any] | None) -> str:
     if not check:
         return ""
@@ -515,6 +565,14 @@ def _comparison_row_from_decision_row(row: dict[str, Any], *, run_dir: Path) -> 
         "confidence": row.get("confidence", ""),
         "analyst_vote_summary": row.get("analyst_vote_summary", ""),
         "analyst_consensus": row.get("analyst_consensus", ""),
+        "comparison_note": _comparison_note(
+            row.get("action", ""),
+            row.get("analyst_consensus", ""),
+            row.get("bullish_count", 0),
+            row.get("bearish_count", 0),
+            row.get("neutral_count", 0),
+            row.get("reasoning", ""),
+        ),
         "reasoning": row.get("reasoning", ""),
         "data_status": row.get("data_status", ""),
         "run_status": row.get("run_status", ""),
@@ -541,6 +599,7 @@ def _failed_comparison_row(
         "confidence": "",
         "analyst_vote_summary": "bullish=0, bearish=0, neutral=0",
         "analyst_consensus": "none",
+        "comparison_note": "",
         "reasoning": reasoning,
         "data_status": OFFLINE_DEMO_DATA_STATUS if offline_demo_data else "",
         "run_status": "failed",
@@ -583,12 +642,16 @@ def _write_preset_comparison_markdown(path: Path, rows: list[dict[str, Any]]) ->
             action = str(row.get("action") or "").strip() or "FAILED"
             quantity = str(row.get("quantity") or "").strip() or "-"
             consensus = str(row.get("analyst_consensus") or "").strip() or "none"
-            lines.append(f"- {row.get('analyst_preset', '')}: {action} / {quantity} / {consensus}")
+            comparison_note = str(row.get("comparison_note") or "").strip()
+            if comparison_note:
+                lines.append(f"- {row.get('analyst_preset', '')}: {action} / {quantity} / {consensus} / {comparison_note}")
+            else:
+                lines.append(f"- {row.get('analyst_preset', '')}: {action} / {quantity} / {consensus}")
         lines.extend(
             [
                 "",
-                "| Preset | Action | Quantity | Confidence | Analyst Votes | Consensus | Data Status | Run Status | Failure | Reasoning | Log |",
-                "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+                "| Preset | Action | Quantity | Confidence | Analyst Votes | Consensus | Comparison Note | Data Status | Run Status | Failure | Reasoning | Log |",
+                "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
             ]
         )
         for row in ticker_rows:
@@ -597,6 +660,7 @@ def _write_preset_comparison_markdown(path: Path, rows: list[dict[str, Any]]) ->
             confidence = str(row.get("confidence") or "").strip() or "-"
             analyst_votes = str(row.get("analyst_vote_summary") or "").replace("|", "\\|").strip()
             consensus = str(row.get("analyst_consensus") or "").replace("|", "\\|").strip() or "none"
+            comparison_note = str(row.get("comparison_note") or "").replace("\n", " ").replace("|", "\\|").strip() or "-"
             data_status = str(row.get("data_status") or "").replace("|", "\\|").strip() or "-"
             run_status = str(row.get("run_status") or "").replace("|", "\\|").strip() or "-"
             failure = str(row.get("failure_classification") or "").replace("|", "\\|").strip() or "-"
@@ -604,7 +668,7 @@ def _write_preset_comparison_markdown(path: Path, rows: list[dict[str, Any]]) ->
             log_path = str(row.get("log_path") or "").replace("|", "\\|").strip() or "-"
             lines.append(
                 f"| {row.get('analyst_preset', '')} | {action} | {quantity} | {confidence} | {analyst_votes} | "
-                f"{consensus} | {data_status} | {run_status} | {failure} | {reasoning} | {log_path} |"
+                f"{consensus} | {comparison_note} | {data_status} | {run_status} | {failure} | {reasoning} | {log_path} |"
             )
         lines.append("")
 

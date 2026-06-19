@@ -132,7 +132,7 @@ def test_run_preset_comparison_writes_rows_and_disclaimers(tmp_path: Path, monke
                 "action": "short",
                 "quantity": "85",
                 "confidence": "82",
-                "reasoning": "Removing news tilted bearish.",
+                "reasoning": "majority bullish signals, moderate confidence",
                 "analyst_vote_summary": "bullish=0, bearish=2, neutral=1",
                 "analyst_consensus": "bearish",
                 "report_note": OFFLINE_DEMO_DISCLAIMER,
@@ -181,12 +181,17 @@ def test_run_preset_comparison_writes_rows_and_disclaimers(tmp_path: Path, monke
     assert rows[1]["analyst_consensus"] == "mixed"
     assert rows[2]["action"] == "short"
     assert rows[3]["action"] == "sell"
+    assert rows[0]["comparison_note"] == ""
+    assert rows[1]["comparison_note"] == "Action is directional despite mixed analyst votes."
+    assert rows[2]["comparison_note"] == "Reasoning should be read as portfolio-manager rationale, not analyst vote majority."
+    assert rows[3]["comparison_note"] == ""
     assert DECISION_SUMMARY_DISCLAIMER in markdown
     assert OFFLINE_DEMO_DISCLAIMER in markdown
     assert "- technical-only: buy / 40 / bullish" in markdown
-    assert "- core: buy / 40 / mixed" in markdown
-    assert "- no-news: short / 85 / bearish" in markdown
+    assert "- core: buy / 40 / mixed / Action is directional despite mixed analyst votes." in markdown
+    assert "- no-news: short / 85 / bearish / Reasoning should be read as portfolio-manager rationale, not analyst vote majority." in markdown
     assert "- all: sell / 80 / bearish" in markdown
+    assert "| Preset | Action | Quantity | Confidence | Analyst Votes | Consensus | Comparison Note | Data Status | Run Status | Failure | Reasoning | Log |" in markdown
 
 
 def test_run_preset_comparison_records_failure_rows_without_stopping(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

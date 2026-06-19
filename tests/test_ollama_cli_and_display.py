@@ -13,6 +13,7 @@ from src.basket_runner import (
     DECISION_SUMMARY_DISCLAIMER,
     BasketRunConfig,
     _analyst_consensus_label,
+    _comparison_note,
     _report_note,
     resolve_analysts_for_preset,
     resolve_data_request_options,
@@ -377,6 +378,31 @@ def test_report_note_preserves_hold_for_mixed_votes() -> None:
     assert _report_note(config, "hold", 0, 1, 1) == (
         "Analyst votes are mixed; no single analyst consensus is shown in this report row."
     )
+
+
+def test_comparison_note_flags_buy_against_bearish_consensus() -> None:
+    assert _comparison_note("buy", "bearish", 4, 8, 5, "majority bullish signals, moderate confidence") == (
+        "Final portfolio-manager action differs from analyst vote consensus. "
+        "Buy action is portfolio-manager output despite bearish analyst vote consensus. "
+        "Reasoning should be read as portfolio-manager rationale, not analyst vote majority."
+    )
+
+
+def test_comparison_note_flags_short_against_bullish_consensus() -> None:
+    assert _comparison_note("short", "bullish", 6, 2, 1, "Risk remains elevated.") == (
+        "Final portfolio-manager action differs from analyst vote consensus. "
+        "Short action is portfolio-manager output despite bullish analyst vote consensus."
+    )
+
+
+def test_comparison_note_flags_directional_action_against_mixed_votes() -> None:
+    assert _comparison_note("sell", "mixed", 2, 2, 1, "Mixed setup with downside risk.") == (
+        "Action is directional despite mixed analyst votes."
+    )
+
+
+def test_comparison_note_omits_warning_for_aligned_action() -> None:
+    assert _comparison_note("buy", "bullish", 3, 1, 0, "majority bullish signals, strong conviction") == ""
 
 
 def test_basket_runner_offline_demo_mode_writes_reports_without_financial_datasets_api_key(
