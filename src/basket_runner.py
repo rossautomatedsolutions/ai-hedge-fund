@@ -61,6 +61,21 @@ ANALYST_PRESETS = {
     "technical-only": ["technical_analyst"],
 }
 NEWS_DISABLED_ANALYSTS = {"sentiment_analyst", "news_sentiment_analyst"}
+PRESET_COMPARISON_CSV_FIELDNAMES = [
+    "ticker",
+    "analyst_preset",
+    "action",
+    "quantity",
+    "confidence",
+    "analyst_vote_summary",
+    "analyst_consensus",
+    "reasoning",
+    "data_status",
+    "run_status",
+    "failure_classification",
+    "run_dir",
+    "log_path",
+]
 DECISION_CSV_FIELDNAMES = [
     "ticker",
     "action",
@@ -157,6 +172,15 @@ class BasketRunConfig:
     model_provider: str = "Ollama"
 
 
+@dataclass
+class PresetComparisonArtifacts:
+    run_dir: Path
+    csv_path: Path
+    markdown_path: Path
+    rows: list[dict[str, Any]]
+    preset_run_dirs: dict[str, str]
+
+
 def resolve_analysts_for_preset(preset: str) -> list[str]:
     all_analysts = [analyst_key for _, analyst_key in ANALYST_ORDER]
     if preset == "all":
@@ -168,6 +192,26 @@ def resolve_analysts_for_preset(preset: str) -> list[str]:
     if preset == "technical-only":
         return list(ANALYST_PRESETS["technical-only"] or [])
     raise ValueError(f"Unknown analyst preset: {preset}")
+
+
+def parse_compare_presets(raw_presets: str | None) -> list[str]:
+    if not raw_presets:
+        return []
+
+    presets: list[str] = []
+    seen: set[str] = set()
+    valid_presets = set(ANALYST_PRESETS.keys())
+    for raw_preset in raw_presets.split(","):
+        preset = raw_preset.strip()
+        if not preset:
+            continue
+        if preset not in valid_presets:
+            raise ValueError(f"Unknown analyst preset: {preset}")
+        if preset in seen:
+            continue
+        presets.append(preset)
+        seen.add(preset)
+    return presets
 
 
 def resolve_data_request_options(
@@ -461,6 +505,181 @@ def _write_decision_summary(path: Path, rows: list[dict[str, Any]]) -> None:
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def _comparison_row_from_decision_row(row: dict[str, Any], *, run_dir: Path) -> dict[str, Any]:
+    ticker = str(row.get("ticker") or "").strip()
+    return {
+        "ticker": ticker,
+        "analyst_preset": row.get("analyst_preset", ""),
+        "action": row.get("action", ""),
+        "quantity": row.get("quantity", ""),
+        "confidence": row.get("confidence", ""),
+        "analyst_vote_summary": row.get("analyst_vote_summary", ""),
+        "analyst_consensus": row.get("analyst_consensus", ""),
+        "reasoning": row.get("reasoning", ""),
+        "data_status": row.get("data_status", ""),
+        "run_status": row.get("run_status", ""),
+        "failure_classification": row.get("failure_classification", ""),
+        "run_dir": run_dir.as_posix(),
+        "log_path": (run_dir / "logs" / f"{ticker}.log").as_posix() if ticker else "",
+    }
+
+
+def _failed_comparison_row(
+    ticker: str,
+    *,
+    preset: str,
+    run_dir: Path,
+    classification: str,
+    reasoning: str,
+    offline_demo_data: bool,
+) -> dict[str, Any]:
+    return {
+        "ticker": ticker,
+        "analyst_preset": preset,
+        "action": "",
+        "quantity": "",
+        "confidence": "",
+        "analyst_vote_summary": "bullish=0, bearish=0, neutral=0",
+        "analyst_consensus": "none",
+        "reasoning": reasoning,
+        "data_status": OFFLINE_DEMO_DATA_STATUS if offline_demo_data else "",
+        "run_status": "failed",
+        "failure_classification": classification,
+        "run_dir": run_dir.as_posix(),
+        "log_path": (run_dir / "logs" / f"{ticker}.log").as_posix(),
+    }
+
+
+def _write_preset_comparison_csv(path: Path, rows: list[dict[str, Any]]) -> None:
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=PRESET_COMPARISON_CSV_FIELDNAMES)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _write_preset_comparison_markdown(path: Path, rows: list[dict[str, Any]]) -> None:
+    uses_offline_demo = any(
+        str(row.get("data_status") or "").strip() in {OFFLINE_DEMO_DATA_STATUS, "fixture_data"} for row in rows
+    )
+    lines = [
+        "# Preset Comparison",
+        "",
+        DECISION_SUMMARY_DISCLAIMER,
+        "",
+    ]
+    if uses_offline_demo:
+        lines.extend(
+            [
+                f"Offline/demo data note: {OFFLINE_DEMO_DISCLAIMER}",
+                "",
+            ]
+        )
+
+    tickers = sorted({str(row.get("ticker") or "").strip() for row in rows if str(row.get("ticker") or "").strip()})
+    for ticker in tickers:
+        ticker_rows = [row for row in rows if str(row.get("ticker") or "").strip() == ticker]
+        lines.extend([f"## {ticker}", ""])
+        for row in ticker_rows:
+            action = str(row.get("action") or "").strip() or "FAILED"
+            quantity = str(row.get("quantity") or "").strip() or "-"
+            consensus = str(row.get("analyst_consensus") or "").strip() or "none"
+            lines.append(f"- {row.get('analyst_preset', '')}: {action} / {quantity} / {consensus}")
+        lines.extend(
+            [
+                "",
+                "| Preset | Action | Quantity | Confidence | Analyst Votes | Consensus | Data Status | Run Status | Failure | Reasoning | Log |",
+                "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+            ]
+        )
+        for row in ticker_rows:
+            action = str(row.get("action") or "").strip() or "FAILED"
+            quantity = str(row.get("quantity") or "").strip() or "-"
+            confidence = str(row.get("confidence") or "").strip() or "-"
+            analyst_votes = str(row.get("analyst_vote_summary") or "").replace("|", "\\|").strip()
+            consensus = str(row.get("analyst_consensus") or "").replace("|", "\\|").strip() or "none"
+            data_status = str(row.get("data_status") or "").replace("|", "\\|").strip() or "-"
+            run_status = str(row.get("run_status") or "").replace("|", "\\|").strip() or "-"
+            failure = str(row.get("failure_classification") or "").replace("|", "\\|").strip() or "-"
+            reasoning = str(row.get("reasoning") or "").replace("\n", " ").replace("|", "\\|").strip() or "-"
+            log_path = str(row.get("log_path") or "").replace("|", "\\|").strip() or "-"
+            lines.append(
+                f"| {row.get('analyst_preset', '')} | {action} | {quantity} | {confidence} | {analyst_votes} | "
+                f"{consensus} | {data_status} | {run_status} | {failure} | {reasoning} | {log_path} |"
+            )
+        lines.append("")
+
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def run_preset_comparison(config: BasketRunConfig, presets: list[str]) -> PresetComparisonArtifacts:
+    comparison_run_dir = _build_run_dir(config.output_dir)
+    preset_base_dir = comparison_run_dir / "preset_runs"
+    preset_base_dir.mkdir(parents=True, exist_ok=True)
+
+    comparison_rows: list[dict[str, Any]] = []
+    preset_run_dirs: dict[str, str] = {}
+
+    for preset in presets:
+        preset_config = BasketRunConfig(
+            tickers=list(config.tickers),
+            basket_name=config.basket_name,
+            model=config.model,
+            output_dir=str(preset_base_dir / preset),
+            max_symbols=config.max_symbols,
+            continue_on_error=config.continue_on_error,
+            show_reasoning=config.show_reasoning,
+            start_date=config.start_date,
+            end_date=config.end_date,
+            dry_run=config.dry_run,
+            data_check_only=config.data_check_only,
+            analyst_preset=preset,
+            analysts=resolve_analysts_for_preset(preset),
+            request_timeout_seconds=config.request_timeout_seconds,
+            max_data_retries=config.max_data_retries,
+            fast_data_mode=config.fast_data_mode,
+            offline_demo_data=config.offline_demo_data,
+            model_provider=config.model_provider,
+        )
+        try:
+            preset_run_dir = run_basket(preset_config)
+            preset_run_dirs[preset] = preset_run_dir.as_posix()
+            csv_path = preset_run_dir / "combined_decisions.csv"
+            if csv_path.exists():
+                with csv_path.open(encoding="utf-8", newline="") as handle:
+                    for row in csv.DictReader(handle):
+                        comparison_rows.append(_comparison_row_from_decision_row(row, run_dir=preset_run_dir))
+        except Exception as exc:
+            preset_run_dir = preset_base_dir / preset
+            preset_run_dir.mkdir(parents=True, exist_ok=True)
+            preset_run_dirs[preset] = preset_run_dir.as_posix()
+            classification, diagnosis = _classify_run_exception(exc)
+            for ticker in config.tickers:
+                comparison_rows.append(
+                    _failed_comparison_row(
+                        ticker,
+                        preset=preset,
+                        run_dir=preset_run_dir,
+                        classification=classification,
+                        reasoning=diagnosis,
+                        offline_demo_data=config.offline_demo_data,
+                    )
+                )
+            if not config.continue_on_error:
+                raise
+
+    csv_path = comparison_run_dir / "preset_comparison.csv"
+    markdown_path = comparison_run_dir / "preset_comparison.md"
+    _write_preset_comparison_csv(csv_path, comparison_rows)
+    _write_preset_comparison_markdown(markdown_path, comparison_rows)
+    return PresetComparisonArtifacts(
+        run_dir=comparison_run_dir,
+        csv_path=csv_path,
+        markdown_path=markdown_path,
+        rows=comparison_rows,
+        preset_run_dirs=preset_run_dirs,
+    )
+
+
 def _classify_run_exception(exc: Exception) -> tuple[str, str]:
     message = str(exc)
     lowered = message.lower()
@@ -682,6 +901,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--continue-on-error", action="store_true")
     parser.add_argument("--show-reasoning", action="store_true")
     parser.add_argument("--analyst-preset", type=str, default="all", choices=sorted(ANALYST_PRESETS.keys()))
+    parser.add_argument(
+        "--compare-presets",
+        type=str,
+        help="Comma-separated analyst presets to run for side-by-side comparison reports.",
+    )
     parser.add_argument("--start-date", type=str)
     parser.add_argument("--end-date", type=str)
     parser.add_argument("--dry-run", action="store_true")
@@ -701,8 +925,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_arg_parser().parse_args()
-    analysts = resolve_analysts_for_preset(args.analyst_preset)
     tickers = _select_tickers(args.tickers, args.basket_name, args.max_symbols)
+    compare_presets = parse_compare_presets(args.compare_presets)
+    analysts = resolve_analysts_for_preset(args.analyst_preset)
 
     if not tickers:
         raise SystemExit("No tickers selected.")
@@ -726,6 +951,24 @@ def main() -> int:
         fast_data_mode=args.fast_data_mode,
         offline_demo_data=args.offline_demo_data,
     )
+
+    if compare_presets:
+        artifacts = run_preset_comparison(config, compare_presets)
+        print(
+            json.dumps(
+                {
+                    "run_dir": artifacts.run_dir.as_posix(),
+                    "preset_comparison_csv": artifacts.csv_path.as_posix(),
+                    "preset_comparison_md": artifacts.markdown_path.as_posix(),
+                    "preset_run_dirs": artifacts.preset_run_dirs,
+                    "dry_run": config.dry_run,
+                    "data_check_only": config.data_check_only,
+                    "offline_demo_data": config.offline_demo_data,
+                },
+                indent=2,
+            )
+        )
+        return 0
 
     run_dir = run_basket(config)
     print(
