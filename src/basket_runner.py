@@ -100,6 +100,27 @@ DECISION_SUMMARY_DISCLAIMER = (
     "Educational use only. This report is not financial advice, not an offer to buy or sell securities, "
     "and not a recommendation to take any trading action."
 )
+RESEARCH_JOURNAL_FIELDNAMES = [
+    "generated_at",
+    "ticker",
+    "model",
+    "data_mode",
+    "offline_demo_data",
+    "run_dir",
+    "presets_analyzed",
+    "action_by_preset",
+    "confidence_by_preset",
+    "consensus_by_preset",
+    "comparison_notes",
+    "bull_case",
+    "bear_case",
+    "key_disagreement_points",
+    "data_limitations",
+    "what_to_check_next_manually",
+    "notable_risks_or_reasons_not_to_act",
+    "research_packet_md_path",
+    "research_packet_json_path",
+]
 
 
 def _parse_tickers(raw_tickers: str | None) -> list[str]:
@@ -189,6 +210,12 @@ class ResearchPacketArtifacts:
     payload: dict[str, Any]
 
 
+@dataclass
+class ResearchJournalArtifacts:
+    journal_path: Path
+    rows_written: int
+
+
 def resolve_analysts_for_preset(preset: str) -> list[str]:
     all_analysts = [analyst_key for _, analyst_key in ANALYST_ORDER]
     if preset == "all":
@@ -252,6 +279,71 @@ def _csv_row_list(path: Path) -> list[dict[str, str]]:
         return list(csv.DictReader(handle))
 
 
+def _json_cell(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=True, separators=(",", ":"))
+
+
+def _default_research_journal_path() -> Path:
+    return Path("outputs") / "research_journal.csv"
+
+
+def _research_journal_rows_from_payload(
+    payload: dict[str, Any],
+    *,
+    research_packet_md_path: Path,
+    research_packet_json_path: Path,
+) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    for ticker_packet in payload.get("tickers", []):
+        rows.append(
+            {
+                "generated_at": str(payload.get("generated_at") or ""),
+                "ticker": str(ticker_packet.get("ticker") or ""),
+                "model": str(ticker_packet.get("model") or payload.get("model") or ""),
+                "data_mode": str(ticker_packet.get("data_mode") or payload.get("data_mode") or ""),
+                "offline_demo_data": str(bool(payload.get("offline_demo_data"))),
+                "run_dir": str(payload.get("run_dir") or ""),
+                "presets_analyzed": _json_cell(ticker_packet.get("presets_analyzed") or []),
+                "action_by_preset": _json_cell(ticker_packet.get("action_by_preset") or {}),
+                "confidence_by_preset": _json_cell(ticker_packet.get("confidence_by_preset") or {}),
+                "consensus_by_preset": _json_cell(ticker_packet.get("consensus_by_preset") or {}),
+                "comparison_notes": _json_cell(ticker_packet.get("comparison_notes") or []),
+                "bull_case": str(ticker_packet.get("bull_case") or ""),
+                "bear_case": str(ticker_packet.get("bear_case") or ""),
+                "key_disagreement_points": _json_cell(ticker_packet.get("key_disagreement_points") or []),
+                "data_limitations": _json_cell(ticker_packet.get("data_limitations") or []),
+                "what_to_check_next_manually": _json_cell(ticker_packet.get("what_to_check_next_manually") or []),
+                "notable_risks_or_reasons_not_to_act": _json_cell(
+                    ticker_packet.get("notable_risks_or_reasons_not_to_act") or []
+                ),
+                "research_packet_md_path": research_packet_md_path.as_posix(),
+                "research_packet_json_path": research_packet_json_path.as_posix(),
+            }
+        )
+    return rows
+
+
+def append_research_journal(
+    artifacts: ResearchPacketArtifacts,
+    *,
+    journal_path: Path | str | None = None,
+) -> ResearchJournalArtifacts:
+    target_path = Path(journal_path) if journal_path else _default_research_journal_path()
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    rows = _research_journal_rows_from_payload(
+        artifacts.payload,
+        research_packet_md_path=artifacts.markdown_path,
+        research_packet_json_path=artifacts.json_path,
+    )
+    write_header = not target_path.exists() or target_path.stat().st_size == 0
+    with target_path.open("a", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=RESEARCH_JOURNAL_FIELDNAMES)
+        if write_header:
+            writer.writeheader()
+        writer.writerows(rows)
+    return ResearchJournalArtifacts(journal_path=target_path, rows_written=len(rows))
+
+
 def _write_summary(
     path: Path,
     config: BasketRunConfig,
@@ -259,6 +351,7 @@ def _write_summary(
     failures: list[dict[str, Any]],
     run_dir: Path,
     data_checks: list[dict[str, Any]] | None = None,
+    research_journal_path: Path | None = None,
 ) -> None:
     data_checks = data_checks or []
     data_check_failures = [check for check in data_checks if not check.get("ok")]
@@ -287,6 +380,8 @@ def _write_summary(
         f"- Data checks failed: `{len(data_check_failures)}`",
         f"- Output directory: `{run_dir.as_posix()}`",
     ]
+    if research_journal_path is not None:
+        lines.append(f"- Research journal appended: `{research_journal_path.as_posix()}`")
     if config.offline_demo_data:
         lines.append(f"- Demo data note: {OFFLINE_DEMO_DISCLAIMER}")
     if data_checks:
@@ -306,6 +401,54 @@ def _write_summary(
             classification = failure.get("classification")
             suffix = f" ({classification})" if classification else ""
             lines.append(f"- `{failure['ticker']}`: {detail}{suffix}")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _write_compare_summary(
+    path: Path,
+    *,
+    config: BasketRunConfig,
+    run_dir: Path,
+    comparison_rows: list[dict[str, Any]],
+    research_journal_path: Path | None = None,
+) -> None:
+    tickers = sorted({str(row.get("ticker") or "").strip() for row in comparison_rows if str(row.get("ticker") or "").strip()})
+    presets = []
+    seen_presets: set[str] = set()
+    for row in comparison_rows:
+        preset = str(row.get("analyst_preset") or "").strip()
+        if preset and preset not in seen_presets:
+            presets.append(preset)
+            seen_presets.add(preset)
+    failures = [row for row in comparison_rows if str(row.get("run_status") or "").strip() == "failed"]
+    uses_offline_demo = any(
+        str(row.get("data_status") or "").strip() in {OFFLINE_DEMO_DATA_STATUS, "fixture_data"} for row in comparison_rows
+    )
+
+    lines = [
+        "# RAS Ollama Basket Run",
+        "",
+        f"- Basket: `{config.basket_name}`",
+        f"- Model: `{config.model}`",
+        f"- Provider: `{config.model_provider}`",
+        "- Mode: `preset-comparison`",
+        f"- Presets analyzed: `{', '.join(presets)}`",
+        f"- Tickers requested: `{', '.join(tickers)}`",
+        f"- Comparison rows: `{len(comparison_rows)}`",
+        f"- Failed comparison rows: `{len(failures)}`",
+        f"- Output directory: `{run_dir.as_posix()}`",
+    ]
+    if research_journal_path is not None:
+        lines.append(f"- Research journal appended: `{research_journal_path.as_posix()}`")
+    if uses_offline_demo:
+        lines.append(f"- Demo data note: {OFFLINE_DEMO_DISCLAIMER}")
+    if failures:
+        lines.extend(["", "## Failures"])
+        for row in failures:
+            detail = str(row.get("reasoning") or "").strip() or "Unknown failure"
+            classification = str(row.get("failure_classification") or "").strip()
+            suffix = f" ({classification})" if classification else ""
+            lines.append(f"- `{row.get('ticker', '')}` / `{row.get('analyst_preset', '')}`: {detail}{suffix}")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -1382,6 +1525,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Write a research_packet.md and research_packet.json summary into the run output directory.",
     )
+    parser.add_argument(
+        "--append-research-journal",
+        action="store_true",
+        help="Append per-ticker research packet rows to a durable local CSV journal.",
+    )
+    parser.add_argument(
+        "--research-journal-path",
+        type=str,
+        help="Custom CSV path for the durable research journal append.",
+    )
     return parser
 
 
@@ -1418,6 +1571,7 @@ def main() -> int:
         artifacts = run_preset_comparison(config, compare_presets)
         research_packet_path = None
         research_packet_json = None
+        research_journal_path = None
         if args.research_packet:
             research_artifacts = write_research_packet(
                 artifacts.run_dir,
@@ -1427,6 +1581,19 @@ def main() -> int:
             )
             research_packet_path = research_artifacts.markdown_path.as_posix()
             research_packet_json = research_artifacts.json_path.as_posix()
+            if args.append_research_journal:
+                journal_artifacts = append_research_journal(
+                    research_artifacts,
+                    journal_path=args.research_journal_path,
+                )
+                research_journal_path = journal_artifacts.journal_path.as_posix()
+                _write_compare_summary(
+                    artifacts.run_dir / "run_summary.md",
+                    config=config,
+                    run_dir=artifacts.run_dir,
+                    comparison_rows=artifacts.rows,
+                    research_journal_path=journal_artifacts.journal_path,
+                )
         print(
             json.dumps(
                 {
@@ -1435,6 +1602,7 @@ def main() -> int:
                     "preset_comparison_md": artifacts.markdown_path.as_posix(),
                     "research_packet_md": research_packet_path,
                     "research_packet_json": research_packet_json,
+                    "research_journal_csv": research_journal_path,
                     "preset_run_dirs": artifacts.preset_run_dirs,
                     "dry_run": config.dry_run,
                     "data_check_only": config.data_check_only,
@@ -1448,16 +1616,40 @@ def main() -> int:
     run_dir = run_basket(config)
     research_packet_path = None
     research_packet_json = None
+    research_journal_path = None
     if args.research_packet:
         research_artifacts = write_research_packet(run_dir, config=config)
         research_packet_path = research_artifacts.markdown_path.as_posix()
         research_packet_json = research_artifacts.json_path.as_posix()
+        if args.append_research_journal:
+            journal_artifacts = append_research_journal(
+                research_artifacts,
+                journal_path=args.research_journal_path,
+            )
+            research_journal_path = journal_artifacts.journal_path.as_posix()
+            failures = json.loads((run_dir / "failures.json").read_text(encoding="utf-8"))
+            data_checks = json.loads((run_dir / "data_check.json").read_text(encoding="utf-8"))
+            successes = [
+                {"ticker": row["ticker"]}
+                for row in _csv_row_list(run_dir / "combined_decisions.csv")
+                if str(row.get("run_status") or "").strip() == "success"
+            ]
+            _write_summary(
+                run_dir / "run_summary.md",
+                config,
+                successes,
+                failures,
+                run_dir,
+                data_checks,
+                research_journal_path=journal_artifacts.journal_path,
+            )
     print(
         json.dumps(
             {
                 "run_dir": run_dir.as_posix(),
                 "research_packet_md": research_packet_path,
                 "research_packet_json": research_packet_json,
+                "research_journal_csv": research_journal_path,
                 "dry_run": config.dry_run,
                 "data_check_only": config.data_check_only,
                 "offline_demo_data": config.offline_demo_data,
