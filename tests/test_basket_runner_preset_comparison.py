@@ -189,6 +189,28 @@ def _write_journal_csv(path: Path, rows: list[dict[str, str]]) -> None:
         writer.writerows(rows)
 
 
+def _repo_review_output_paths() -> list[Path]:
+    return [
+        Path("outputs") / "research_journal_review.md",
+        Path("outputs") / "research_journal_review_BB.md",
+        Path("outputs") / "research_journal_review.json",
+        Path("outputs") / "research_journal_review_BB.json",
+    ]
+
+
+def _snapshot_repo_review_outputs() -> dict[Path, bytes | None]:
+    return {path: path.read_bytes() if path.exists() else None for path in _repo_review_output_paths()}
+
+
+def _assert_repo_review_outputs_unchanged(snapshot: dict[Path, bytes | None]) -> None:
+    for path, original_bytes in snapshot.items():
+        if original_bytes is None:
+            assert not path.exists()
+        else:
+            assert path.exists()
+            assert path.read_bytes() == original_bytes
+
+
 def test_build_arg_parser_accepts_compare_presets() -> None:
     args = build_arg_parser().parse_args(
         [
@@ -675,6 +697,8 @@ def test_research_journal_json_and_list_fields_are_valid_json_strings(tmp_path: 
 
 def test_review_research_journal_one_ticker(tmp_path: Path) -> None:
     journal_path = tmp_path / "journal.csv"
+    output_path = tmp_path / "reports" / "research_journal_review_BB.md"
+    snapshot = _snapshot_repo_review_outputs()
     run_dir = tmp_path / "runs" / "bb_latest"
     _write_journal_csv(
         journal_path,
@@ -697,13 +721,13 @@ def test_review_research_journal_one_ticker(tmp_path: Path) -> None:
         ],
     )
 
-    artifacts = review_research_journal(journal_path=journal_path, ticker="BB")
+    artifacts = review_research_journal(journal_path=journal_path, ticker="BB", output_path=output_path)
     markdown = artifacts.markdown_path.read_text(encoding="utf-8")
     payload = json.loads(artifacts.json_path.read_text(encoding="utf-8"))
 
     assert artifacts.entries_reviewed == 2
-    assert artifacts.markdown_path.name == "research_journal_review_BB.md"
-    assert artifacts.json_path.name == "research_journal_review_BB.json"
+    assert artifacts.markdown_path == output_path
+    assert artifacts.json_path == output_path.with_suffix(".json")
     assert DECISION_SUMMARY_DISCLAIMER in markdown
     assert f"- Source journal path: `{journal_path.as_posix()}`" in markdown
     assert "- Scope: `BB`" in markdown
@@ -715,10 +739,13 @@ def test_review_research_journal_one_ticker(tmp_path: Path) -> None:
     assert payload["scope"]["ticker"] == "BB"
     assert payload["entries_reviewed"] == 2
     assert payload["tickers"][0]["ticker"] == "BB"
+    _assert_repo_review_outputs_unchanged(snapshot)
 
 
 def test_review_research_journal_all_tickers_grouped(tmp_path: Path) -> None:
     journal_path = tmp_path / "journal.csv"
+    output_path = tmp_path / "reports" / "research_journal_review.md"
+    snapshot = _snapshot_repo_review_outputs()
     _write_journal_csv(
         journal_path,
         [
@@ -736,34 +763,42 @@ def test_review_research_journal_all_tickers_grouped(tmp_path: Path) -> None:
         ],
     )
 
-    artifacts = review_research_journal(journal_path=journal_path)
+    artifacts = review_research_journal(journal_path=journal_path, output_path=output_path)
     markdown = artifacts.markdown_path.read_text(encoding="utf-8")
     payload = json.loads(artifacts.json_path.read_text(encoding="utf-8"))
 
-    assert artifacts.markdown_path.name == "research_journal_review.md"
-    assert artifacts.json_path.name == "research_journal_review.json"
+    assert artifacts.markdown_path == output_path
+    assert artifacts.json_path == output_path.with_suffix(".json")
     assert "- Scope: `All tickers`" in markdown
     assert "## BB" in markdown
     assert "## GME" in markdown
     assert [ticker["ticker"] for ticker in payload["tickers"]] == ["BB", "GME"]
+    _assert_repo_review_outputs_unchanged(snapshot)
 
 
 def test_review_research_journal_custom_journal_path(tmp_path: Path) -> None:
     journal_path = tmp_path / "nested" / "custom_journal.csv"
+    output_path = tmp_path / "reports" / "custom_journal_review_BB.md"
+    snapshot = _snapshot_repo_review_outputs()
     _write_journal_csv(
         journal_path,
         [_journal_row(ticker="BB", generated_at="2026-06-20T09:00:00", run_dir=tmp_path / "runs" / "bb")],
     )
 
-    artifacts = review_research_journal(journal_path=journal_path, ticker="BB")
+    artifacts = review_research_journal(journal_path=journal_path, ticker="BB", output_path=output_path)
 
     assert artifacts.journal_path == journal_path
+    assert artifacts.markdown_path == output_path
+    assert artifacts.json_path == output_path.with_suffix(".json")
     assert artifacts.markdown_path.exists()
+    assert artifacts.json_path.exists()
+    _assert_repo_review_outputs_unchanged(snapshot)
 
 
 def test_review_research_journal_custom_output_path(tmp_path: Path) -> None:
     journal_path = tmp_path / "journal.csv"
     output_path = tmp_path / "reports" / "bb_review.md"
+    snapshot = _snapshot_repo_review_outputs()
     _write_journal_csv(
         journal_path,
         [_journal_row(ticker="BB", generated_at="2026-06-20T09:00:00", run_dir=tmp_path / "runs" / "bb")],
@@ -775,15 +810,18 @@ def test_review_research_journal_custom_output_path(tmp_path: Path) -> None:
     assert artifacts.json_path == output_path.with_suffix(".json")
     assert artifacts.markdown_path.exists()
     assert artifacts.json_path.exists()
+    _assert_repo_review_outputs_unchanged(snapshot)
 
 
 def test_review_research_journal_malformed_json_adds_warning_without_crashing(tmp_path: Path) -> None:
     journal_path = tmp_path / "journal.csv"
+    output_path = tmp_path / "reports" / "malformed_review_BB.md"
+    snapshot = _snapshot_repo_review_outputs()
     row = _journal_row(ticker="BB", generated_at="2026-06-20T09:00:00", run_dir=tmp_path / "runs" / "bb")
     row["action_by_preset"] = '{"core":"buy"'
     _write_journal_csv(journal_path, [row])
 
-    artifacts = review_research_journal(journal_path=journal_path, ticker="BB")
+    artifacts = review_research_journal(journal_path=journal_path, ticker="BB", output_path=output_path)
     markdown = artifacts.markdown_path.read_text(encoding="utf-8")
     payload = json.loads(artifacts.json_path.read_text(encoding="utf-8"))
 
@@ -791,10 +829,13 @@ def test_review_research_journal_malformed_json_adds_warning_without_crashing(tm
     assert "Malformed JSON in `action_by_preset`" in markdown
     assert payload["tickers"][0]["entries"][0]["action_by_preset"]["_malformed"] is True
     assert payload["tickers"][0]["entries"][0]["action_by_preset"]["_raw"] == '{"core":"buy"'
+    _assert_repo_review_outputs_unchanged(snapshot)
 
 
 def test_review_mode_does_not_run_analyst_or_data_workflow(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     journal_path = tmp_path / "journal.csv"
+    output_path = tmp_path / "reports" / "cli_review_BB.md"
+    snapshot = _snapshot_repo_review_outputs()
     _write_journal_csv(
         journal_path,
         [_journal_row(ticker="BB", generated_at="2026-06-20T09:00:00", run_dir=tmp_path / "runs" / "bb")],
@@ -815,10 +856,22 @@ def test_review_mode_does_not_run_analyst_or_data_workflow(tmp_path: Path, monke
     monkeypatch.setattr(
         sys,
         "argv",
-        ["basket_runner.py", "--review-research-journal", "--ticker", "BB", "--research-journal-path", str(journal_path)],
+        [
+            "basket_runner.py",
+            "--review-research-journal",
+            "--ticker",
+            "BB",
+            "--research-journal-path",
+            str(journal_path),
+            "--journal-review-output",
+            str(output_path),
+        ],
     )
 
     assert main() == 0
+    assert output_path.exists()
+    assert output_path.with_suffix(".json").exists()
+    _assert_repo_review_outputs_unchanged(snapshot)
 
 
 def test_review_research_journal_missing_file_gives_clear_error(tmp_path: Path) -> None:
