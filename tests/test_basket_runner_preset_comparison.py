@@ -12,6 +12,7 @@ from src.basket_runner import (
     DECISION_SUMMARY_DISCLAIMER,
     RESEARCH_JOURNAL_FIELDNAMES,
     append_research_journal,
+    build_research_watchlist,
     build_arg_parser,
     main,
     parse_compare_presets,
@@ -141,6 +142,7 @@ def _journal_row(
     research_packet_name: str = "research_packet",
     model: str = "llama3.1:latest",
     data_mode: str = "offline_demo",
+    offline_demo_data: bool = True,
     action_by_preset: dict[str, str] | None = None,
     confidence_by_preset: dict[str, str] | None = None,
     consensus_by_preset: dict[str, str] | None = None,
@@ -151,19 +153,26 @@ def _journal_row(
     what_to_check_next_manually: list[str] | None = None,
     notable_risks_or_reasons_not_to_act: list[str] | None = None,
 ) -> dict[str, str]:
-    action_by_preset = action_by_preset or {"core": "buy", "all": "hold"}
-    confidence_by_preset = confidence_by_preset or {"core": "67", "all": "55"}
-    consensus_by_preset = consensus_by_preset or {"core": "bullish", "all": "mixed"}
-    comparison_notes = comparison_notes or ["Core was constructive while all stayed mixed."]
-    key_disagreement_points = key_disagreement_points or ["Timing disagreement", "Valuation disagreement"]
-    what_to_check_next_manually = what_to_check_next_manually or ["Check earnings date", "Verify volume trend"]
-    notable_risks_or_reasons_not_to_act = notable_risks_or_reasons_not_to_act or ["Macro volatility", "Thin conviction"]
+    if action_by_preset is None:
+        action_by_preset = {"core": "buy", "all": "hold"}
+    if confidence_by_preset is None:
+        confidence_by_preset = {"core": "67", "all": "55"}
+    if consensus_by_preset is None:
+        consensus_by_preset = {"core": "bullish", "all": "mixed"}
+    if comparison_notes is None:
+        comparison_notes = ["Core was constructive while all stayed mixed."]
+    if key_disagreement_points is None:
+        key_disagreement_points = ["Timing disagreement", "Valuation disagreement"]
+    if what_to_check_next_manually is None:
+        what_to_check_next_manually = ["Check earnings date", "Verify volume trend"]
+    if notable_risks_or_reasons_not_to_act is None:
+        notable_risks_or_reasons_not_to_act = ["Macro volatility", "Thin conviction"]
     return {
         "generated_at": generated_at,
         "ticker": ticker,
         "model": model,
         "data_mode": data_mode,
-        "offline_demo_data": "True",
+        "offline_demo_data": str(offline_demo_data),
         "run_dir": run_dir.as_posix(),
         "presets_analyzed": json.dumps(sorted(action_by_preset.keys())),
         "action_by_preset": json.dumps(action_by_preset),
@@ -203,6 +212,26 @@ def _snapshot_repo_review_outputs() -> dict[Path, bytes | None]:
 
 
 def _assert_repo_review_outputs_unchanged(snapshot: dict[Path, bytes | None]) -> None:
+    for path, original_bytes in snapshot.items():
+        if original_bytes is None:
+            assert not path.exists()
+        else:
+            assert path.exists()
+            assert path.read_bytes() == original_bytes
+
+
+def _repo_watchlist_output_paths() -> list[Path]:
+    return [
+        Path("outputs") / "research_watchlist.md",
+        Path("outputs") / "research_watchlist.json",
+    ]
+
+
+def _snapshot_repo_watchlist_outputs() -> dict[Path, bytes | None]:
+    return {path: path.read_bytes() if path.exists() else None for path in _repo_watchlist_output_paths()}
+
+
+def _assert_repo_watchlist_outputs_unchanged(snapshot: dict[Path, bytes | None]) -> None:
     for path, original_bytes in snapshot.items():
         if original_bytes is None:
             assert not path.exists()
@@ -263,6 +292,22 @@ def test_build_arg_parser_accepts_review_research_journal_flags() -> None:
     assert args.review_research_journal is True
     assert args.ticker == "BB"
     assert args.journal_review_output == "outputs/research_journal_review_BB.md"
+
+
+def test_build_arg_parser_accepts_research_watchlist_flags() -> None:
+    args = build_arg_parser().parse_args(
+        [
+            "--research-watchlist",
+            "--research-journal-path",
+            "outputs/research_journal.csv",
+            "--watchlist-output",
+            "outputs/research_watchlist.md",
+        ]
+    )
+
+    assert args.research_watchlist is True
+    assert args.research_journal_path == "outputs/research_journal.csv"
+    assert args.watchlist_output == "outputs/research_watchlist.md"
 
 
 def test_run_preset_comparison_writes_rows_and_disclaimers(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -879,6 +924,281 @@ def test_review_research_journal_missing_file_gives_clear_error(tmp_path: Path) 
 
     with pytest.raises(SystemExit, match="Research journal file not found:"):
         review_research_journal(journal_path=missing_path, ticker="BB")
+
+
+def test_research_watchlist_report_generation_from_sample_journal(tmp_path: Path) -> None:
+    journal_path = tmp_path / "journal.csv"
+    output_path = tmp_path / "reports" / "research_watchlist.md"
+    snapshot = _snapshot_repo_watchlist_outputs()
+    _write_journal_csv(
+        journal_path,
+        [
+            _journal_row(
+                ticker="BB",
+                generated_at="2026-06-20T09:00:00",
+                run_dir=tmp_path / "runs" / "bb1",
+                action_by_preset={"technical-only": "buy", "core": "buy", "all": "hold"},
+                consensus_by_preset={"technical-only": "bullish", "core": "bullish", "all": "mixed"},
+                comparison_notes=[],
+                bull_case="Momentum improving; catalyst setup",
+                bear_case="Execution risk; demand uncertainty",
+            ),
+            _journal_row(
+                ticker="BB",
+                generated_at="2026-06-21T09:00:00",
+                run_dir=tmp_path / "runs" / "bb2",
+                action_by_preset={"technical-only": "buy", "core": "buy", "all": "hold"},
+                consensus_by_preset={"technical-only": "bullish", "core": "bullish", "all": "mixed"},
+                comparison_notes=[],
+                bull_case="Trend intact; setup improving",
+                bear_case="Execution risk remains",
+            ),
+            _journal_row(
+                ticker="GME",
+                generated_at="2026-06-21T10:00:00",
+                run_dir=tmp_path / "runs" / "gme1",
+                action_by_preset={"technical-only": "buy", "core": "hold", "all": "sell"},
+                consensus_by_preset={"technical-only": "bullish", "core": "mixed", "all": "bearish"},
+                comparison_notes=["Preset conflict requires manual review."],
+            ),
+            _journal_row(
+                ticker="NVDA",
+                generated_at="2026-06-21T11:00:00",
+                run_dir=tmp_path / "runs" / "nvda1",
+                action_by_preset={"core": "sell", "all": "sell", "no-news": "short"},
+                consensus_by_preset={"core": "bearish", "all": "bearish", "no-news": "bearish"},
+                comparison_notes=[],
+                bull_case="AI demand still exists",
+                bear_case="Crowded positioning; valuation risk",
+            ),
+            _journal_row(
+                ticker="AAPL",
+                generated_at="2026-06-21T12:00:00",
+                run_dir=tmp_path / "runs" / "aapl1",
+                action_by_preset={"core": "buy"},
+                consensus_by_preset={"core": "bullish"},
+                comparison_notes=[],
+            ),
+        ],
+    )
+
+    artifacts = build_research_watchlist(journal_path=journal_path, output_path=output_path)
+    markdown = artifacts.markdown_path.read_text(encoding="utf-8")
+
+    assert artifacts.markdown_path == output_path
+    assert artifacts.json_path == output_path.with_suffix(".json")
+    assert DECISION_SUMMARY_DISCLAIMER in markdown
+    assert f"- Source journal path: `{journal_path.as_posix()}`" in markdown
+    assert "## Strong Follow-Up Candidates" in markdown
+    assert "## Mixed / Disagreement Candidates" in markdown
+    assert "## Bearish / Avoid For Now Candidates" in markdown
+    assert "## Insufficient History / Needs More Runs" in markdown
+    assert "Scoring heuristic:" in markdown
+    assert "| Ticker | Latest Generated At | Score | Category | Latest Actions | Latest Consensus | Disagreement Flags | Latest Bull Case | Latest Bear Case | Latest Packet Path |" in markdown
+    _assert_repo_watchlist_outputs_unchanged(snapshot)
+
+
+def test_research_watchlist_json_companion_generation(tmp_path: Path) -> None:
+    journal_path = tmp_path / "journal.csv"
+    output_path = tmp_path / "reports" / "research_watchlist.md"
+    snapshot = _snapshot_repo_watchlist_outputs()
+    _write_journal_csv(
+        journal_path,
+        [_journal_row(ticker="BB", generated_at="2026-06-20T09:00:00", run_dir=tmp_path / "runs" / "bb")],
+    )
+
+    artifacts = build_research_watchlist(journal_path=journal_path, output_path=output_path)
+    payload = json.loads(artifacts.json_path.read_text(encoding="utf-8"))
+
+    assert artifacts.json_path.exists()
+    assert payload["source_journal_path"] == journal_path.as_posix()
+    assert payload["rows_reviewed"] == 1
+    assert payload["ticker_count"] == 1
+    assert payload["scoring_rules"]
+    assert payload["per_ticker"][0]["ticker"] == "BB"
+    assert "categories" in payload
+    _assert_repo_watchlist_outputs_unchanged(snapshot)
+
+
+def test_research_watchlist_categorization_sections(tmp_path: Path) -> None:
+    journal_path = tmp_path / "journal.csv"
+    output_path = tmp_path / "reports" / "watchlist.md"
+    snapshot = _snapshot_repo_watchlist_outputs()
+    _write_journal_csv(
+        journal_path,
+        [
+            _journal_row(
+                ticker="BB",
+                generated_at="2026-06-20T09:00:00",
+                run_dir=tmp_path / "runs" / "bb1",
+                data_mode="live",
+                offline_demo_data=False,
+                action_by_preset={"technical-only": "buy", "core": "buy", "all": "buy"},
+                consensus_by_preset={"technical-only": "bullish", "core": "bullish", "all": "bullish"},
+                comparison_notes=[],
+            ),
+            _journal_row(
+                ticker="BB",
+                generated_at="2026-06-21T09:00:00",
+                run_dir=tmp_path / "runs" / "bb2",
+                data_mode="live",
+                offline_demo_data=False,
+                action_by_preset={"technical-only": "buy", "core": "buy", "all": "buy"},
+                consensus_by_preset={"technical-only": "bullish", "core": "bullish", "all": "bullish"},
+                comparison_notes=[],
+            ),
+            _journal_row(
+                ticker="GME",
+                generated_at="2026-06-21T10:00:00",
+                run_dir=tmp_path / "runs" / "gme1",
+                data_mode="live",
+                offline_demo_data=False,
+                action_by_preset={"technical-only": "buy", "core": "hold", "all": "hold"},
+                consensus_by_preset={"technical-only": "bullish", "core": "mixed", "all": "mixed"},
+                comparison_notes=["Disagreement"],
+            ),
+            _journal_row(
+                ticker="GME",
+                generated_at="2026-06-22T10:00:00",
+                run_dir=tmp_path / "runs" / "gme2",
+                data_mode="live",
+                offline_demo_data=False,
+                action_by_preset={"technical-only": "buy", "core": "hold", "all": "hold"},
+                consensus_by_preset={"technical-only": "bullish", "core": "mixed", "all": "mixed"},
+                comparison_notes=["Disagreement"],
+            ),
+            _journal_row(
+                ticker="NVDA",
+                generated_at="2026-06-21T11:00:00",
+                run_dir=tmp_path / "runs" / "nvda1",
+                data_mode="live",
+                offline_demo_data=False,
+                action_by_preset={"core": "sell", "all": "sell", "no-news": "short"},
+                consensus_by_preset={"core": "bearish", "all": "bearish", "no-news": "bearish"},
+                comparison_notes=[],
+            ),
+            _journal_row(
+                ticker="NVDA",
+                generated_at="2026-06-22T11:00:00",
+                run_dir=tmp_path / "runs" / "nvda2",
+                data_mode="live",
+                offline_demo_data=False,
+                action_by_preset={"core": "sell", "all": "sell", "no-news": "short"},
+                consensus_by_preset={"core": "bearish", "all": "bearish", "no-news": "bearish"},
+                comparison_notes=[],
+            ),
+            _journal_row(
+                ticker="AAPL",
+                generated_at="2026-06-21T12:00:00",
+                run_dir=tmp_path / "runs" / "aapl1",
+                data_mode="live",
+                offline_demo_data=False,
+                action_by_preset={"core": "buy"},
+                consensus_by_preset={"core": "bullish"},
+                comparison_notes=[],
+            ),
+        ],
+    )
+
+    artifacts = build_research_watchlist(journal_path=journal_path, output_path=output_path)
+    payload = json.loads(artifacts.json_path.read_text(encoding="utf-8"))
+
+    assert "BB" in payload["categories"]["Strong Follow-Up Candidates"]
+    assert "GME" in payload["categories"]["Mixed / Disagreement Candidates"]
+    assert "NVDA" in payload["categories"]["Bearish / Avoid For Now Candidates"]
+    assert "AAPL" in payload["categories"]["Insufficient History / Needs More Runs"]
+    _assert_repo_watchlist_outputs_unchanged(snapshot)
+
+
+def test_research_watchlist_custom_journal_path(tmp_path: Path) -> None:
+    journal_path = tmp_path / "nested" / "custom_journal.csv"
+    output_path = tmp_path / "reports" / "watchlist.md"
+    snapshot = _snapshot_repo_watchlist_outputs()
+    _write_journal_csv(journal_path, [_journal_row(ticker="BB", generated_at="2026-06-20T09:00:00", run_dir=tmp_path / "runs" / "bb")])
+
+    artifacts = build_research_watchlist(journal_path=journal_path, output_path=output_path)
+
+    assert artifacts.journal_path == journal_path
+    assert artifacts.markdown_path == output_path
+    assert artifacts.json_path == output_path.with_suffix(".json")
+    _assert_repo_watchlist_outputs_unchanged(snapshot)
+
+
+def test_research_watchlist_custom_output_path(tmp_path: Path) -> None:
+    journal_path = tmp_path / "journal.csv"
+    output_path = tmp_path / "custom" / "my_watchlist.md"
+    snapshot = _snapshot_repo_watchlist_outputs()
+    _write_journal_csv(journal_path, [_journal_row(ticker="BB", generated_at="2026-06-20T09:00:00", run_dir=tmp_path / "runs" / "bb")])
+
+    artifacts = build_research_watchlist(journal_path=journal_path, output_path=output_path)
+
+    assert artifacts.markdown_path == output_path
+    assert artifacts.json_path == output_path.with_suffix(".json")
+    assert output_path.exists()
+    assert output_path.with_suffix(".json").exists()
+    _assert_repo_watchlist_outputs_unchanged(snapshot)
+
+
+def test_research_watchlist_malformed_json_warning(tmp_path: Path) -> None:
+    journal_path = tmp_path / "journal.csv"
+    output_path = tmp_path / "reports" / "watchlist.md"
+    snapshot = _snapshot_repo_watchlist_outputs()
+    row = _journal_row(ticker="BB", generated_at="2026-06-20T09:00:00", run_dir=tmp_path / "runs" / "bb")
+    row["consensus_by_preset"] = '{"core":"bullish"'
+    _write_journal_csv(journal_path, [row])
+
+    artifacts = build_research_watchlist(journal_path=journal_path, output_path=output_path)
+    markdown = artifacts.markdown_path.read_text(encoding="utf-8")
+    payload = json.loads(artifacts.json_path.read_text(encoding="utf-8"))
+
+    assert artifacts.warnings
+    assert "Malformed JSON in `consensus_by_preset`" in markdown
+    assert payload["warnings"]
+    _assert_repo_watchlist_outputs_unchanged(snapshot)
+
+
+def test_research_watchlist_mode_does_not_run_analyst_or_data_workflow(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    journal_path = tmp_path / "journal.csv"
+    output_path = tmp_path / "reports" / "watchlist.md"
+    snapshot = _snapshot_repo_watchlist_outputs()
+    _write_journal_csv(journal_path, [_journal_row(ticker="BB", generated_at="2026-06-20T09:00:00", run_dir=tmp_path / "runs" / "bb")])
+
+    monkeypatch.setattr(
+        "src.basket_runner.run_basket",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("run_basket should not run in watchlist mode")),
+    )
+    monkeypatch.setattr(
+        "src.basket_runner.run_preset_comparison",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("preset comparison should not run in watchlist mode")),
+    )
+    monkeypatch.setattr(
+        "src.basket_runner.resolve_analysts_for_preset",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("analysts should not resolve in watchlist mode")),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "basket_runner.py",
+            "--research-watchlist",
+            "--research-journal-path",
+            str(journal_path),
+            "--watchlist-output",
+            str(output_path),
+        ],
+    )
+
+    assert main() == 0
+    assert output_path.exists()
+    assert output_path.with_suffix(".json").exists()
+    _assert_repo_watchlist_outputs_unchanged(snapshot)
+
+
+def test_research_watchlist_missing_journal_file_error(tmp_path: Path) -> None:
+    missing_path = tmp_path / "missing.csv"
+
+    with pytest.raises(SystemExit, match="Research journal file not found:"):
+        build_research_watchlist(journal_path=missing_path, output_path=tmp_path / "reports" / "watchlist.md")
 
 
 def test_main_without_compare_presets_keeps_single_preset_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
