@@ -10,12 +10,16 @@ import pytest
 from src.basket_runner import (
     BasketRunConfig,
     DECISION_SUMMARY_DISCLAIMER,
+    HUMAN_REVIEW_LOG_FIELDNAMES,
     RESEARCH_JOURNAL_FIELDNAMES,
     append_research_journal,
     build_research_watchlist,
+    build_validation_checklist,
     build_arg_parser,
     main,
     parse_compare_presets,
+    record_human_review,
+    review_human_reviews,
     review_research_journal,
     run_preset_comparison,
     write_research_packet,
@@ -240,6 +244,68 @@ def _assert_repo_watchlist_outputs_unchanged(snapshot: dict[Path, bytes | None])
             assert path.read_bytes() == original_bytes
 
 
+def _repo_validation_output_paths() -> list[Path]:
+    return [
+        Path("outputs") / "validation_checklist_BB.md",
+        Path("outputs") / "validation_checklist_BB.json",
+    ]
+
+
+def _snapshot_repo_validation_outputs() -> dict[Path, bytes | None]:
+    return {path: path.read_bytes() if path.exists() else None for path in _repo_validation_output_paths()}
+
+
+def _assert_repo_validation_outputs_unchanged(snapshot: dict[Path, bytes | None]) -> None:
+    for path, original_bytes in snapshot.items():
+        if original_bytes is None:
+            assert not path.exists()
+        else:
+            assert path.exists()
+            assert path.read_bytes() == original_bytes
+
+
+def _repo_human_review_log_paths() -> list[Path]:
+    return [Path("outputs") / "human_review_log.csv"]
+
+
+def _snapshot_repo_human_review_logs() -> dict[Path, bytes | None]:
+    return {path: path.read_bytes() if path.exists() else None for path in _repo_human_review_log_paths()}
+
+
+def _assert_repo_human_review_logs_unchanged(snapshot: dict[Path, bytes | None]) -> None:
+    for path, original_bytes in snapshot.items():
+        if original_bytes is None:
+            assert not path.exists()
+        else:
+            assert path.exists()
+            assert path.read_bytes() == original_bytes
+
+
+def _repo_human_review_summary_paths() -> list[Path]:
+    return [
+        Path("outputs") / "human_review_summary.md",
+        Path("outputs") / "human_review_summary.json",
+    ]
+
+
+def _snapshot_repo_human_review_summary_outputs() -> dict[Path, bytes | None]:
+    return {path: path.read_bytes() if path.exists() else None for path in _repo_human_review_summary_paths()}
+
+
+def _assert_repo_human_review_summary_outputs_unchanged(snapshot: dict[Path, bytes | None]) -> None:
+    for path, original_bytes in snapshot.items():
+        if original_bytes is None:
+            assert not path.exists()
+        else:
+            assert path.exists()
+            assert path.read_bytes() == original_bytes
+
+
+def _write_watchlist_json(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
 def test_build_arg_parser_accepts_compare_presets() -> None:
     args = build_arg_parser().parse_args(
         [
@@ -308,6 +374,70 @@ def test_build_arg_parser_accepts_research_watchlist_flags() -> None:
     assert args.research_watchlist is True
     assert args.research_journal_path == "outputs/research_journal.csv"
     assert args.watchlist_output == "outputs/research_watchlist.md"
+
+
+def test_build_arg_parser_accepts_validation_checklist_flags() -> None:
+    args = build_arg_parser().parse_args(
+        [
+            "--validation-checklist",
+            "--ticker",
+            "BB",
+            "--research-journal-path",
+            "outputs/research_journal.csv",
+            "--watchlist-path",
+            "outputs/research_watchlist.json",
+            "--validation-output",
+            "outputs/validation_checklist_BB.md",
+        ]
+    )
+
+    assert args.validation_checklist is True
+    assert args.ticker == "BB"
+    assert args.watchlist_path == "outputs/research_watchlist.json"
+    assert args.validation_output == "outputs/validation_checklist_BB.md"
+
+
+def test_build_arg_parser_accepts_record_human_review_flags() -> None:
+    args = build_arg_parser().parse_args(
+        [
+            "--record-human-review",
+            "--ticker",
+            "BB",
+            "--human-status",
+            "Watchlist",
+            "--review-notes",
+            "Needs current data.",
+            "--validation-checklist-path",
+            "outputs/validation_checklist_BB.json",
+            "--human-review-log-path",
+            "outputs/human_review_log.csv",
+        ]
+    )
+
+    assert args.record_human_review is True
+    assert args.ticker == "BB"
+    assert args.human_status == "Watchlist"
+    assert args.validation_checklist_path == "outputs/validation_checklist_BB.json"
+    assert args.human_review_log_path == "outputs/human_review_log.csv"
+
+
+def test_build_arg_parser_accepts_review_human_reviews_flags() -> None:
+    args = build_arg_parser().parse_args(
+        [
+            "--review-human-reviews",
+            "--ticker",
+            "BB",
+            "--human-review-log-path",
+            "outputs/human_review_log.csv",
+            "--human-review-summary-output",
+            "outputs/human_review_summary.md",
+        ]
+    )
+
+    assert args.review_human_reviews is True
+    assert args.ticker == "BB"
+    assert args.human_review_log_path == "outputs/human_review_log.csv"
+    assert args.human_review_summary_output == "outputs/human_review_summary.md"
 
 
 def test_run_preset_comparison_writes_rows_and_disclaimers(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1199,6 +1329,916 @@ def test_research_watchlist_missing_journal_file_error(tmp_path: Path) -> None:
 
     with pytest.raises(SystemExit, match="Research journal file not found:"):
         build_research_watchlist(journal_path=missing_path, output_path=tmp_path / "reports" / "watchlist.md")
+
+
+def test_validation_checklist_generation_for_ticker_from_sample_journal(tmp_path: Path) -> None:
+    journal_path = tmp_path / "journal.csv"
+    output_path = tmp_path / "reports" / "validation_checklist_BB.md"
+    snapshot = _snapshot_repo_validation_outputs()
+    _write_journal_csv(
+        journal_path,
+        [
+            _journal_row(
+                ticker="BB",
+                generated_at="2026-06-20T09:00:00",
+                run_dir=tmp_path / "runs" / "bb1",
+                action_by_preset={"technical-only": "buy", "core": "buy", "all": "hold"},
+                consensus_by_preset={"technical-only": "bullish", "core": "mixed", "all": "mixed"},
+                comparison_notes=["Preset conflict requires review."],
+            ),
+            _journal_row(
+                ticker="BB",
+                generated_at="2026-06-21T09:00:00",
+                run_dir=tmp_path / "runs" / "bb2",
+                action_by_preset={"technical-only": "buy", "core": "buy", "all": "hold"},
+                consensus_by_preset={"technical-only": "bullish", "core": "mixed", "all": "mixed"},
+                comparison_notes=["Preset conflict requires review."],
+            ),
+        ],
+    )
+
+    artifacts = build_validation_checklist(ticker="BB", journal_path=journal_path, output_path=output_path)
+    markdown = artifacts.markdown_path.read_text(encoding="utf-8")
+    payload = json.loads(artifacts.json_path.read_text(encoding="utf-8"))
+
+    assert artifacts.markdown_path == output_path
+    assert artifacts.json_path == output_path.with_suffix(".json")
+    assert DECISION_SUMMARY_DISCLAIMER in markdown
+    assert "- Ticker: `BB`" in markdown
+    assert f"- Source journal path: `{journal_path.as_posix()}`" in markdown
+    assert "## Current Price / Chart Validation" in markdown
+    assert "- [ ] Confirm current price and date of quote." in markdown
+    assert "## Final Status" in markdown
+    assert payload["ticker"] == "BB"
+    assert payload["latest_actions"]["technical-only"] == "buy"
+    assert payload["checklist_sections"]
+    _assert_repo_validation_outputs_unchanged(snapshot)
+
+
+def test_validation_checklist_uses_watchlist_json_when_available(tmp_path: Path) -> None:
+    journal_path = tmp_path / "journal.csv"
+    watchlist_path = tmp_path / "research_watchlist.json"
+    output_path = tmp_path / "reports" / "validation_checklist_BB.md"
+    snapshot = _snapshot_repo_validation_outputs()
+    _write_journal_csv(
+        journal_path,
+        [_journal_row(ticker="BB", generated_at="2026-06-21T09:00:00", run_dir=tmp_path / "runs" / "bb")],
+    )
+    _write_watchlist_json(
+        watchlist_path,
+        {
+            "generated_at": "2026-06-24T10:00:00",
+            "source_journal_path": journal_path.as_posix(),
+            "rows_reviewed": 1,
+            "ticker_count": 1,
+            "scoring_rules": [],
+            "per_ticker": [
+                {
+                    "ticker": "BB",
+                    "score": 3,
+                    "category": "Mixed / Disagreement Candidates",
+                    "disagreement_flags": ["comparison notes present", "needs validation"],
+                }
+            ],
+            "categories": {},
+            "warnings": [],
+        },
+    )
+
+    artifacts = build_validation_checklist(
+        ticker="BB",
+        journal_path=journal_path,
+        watchlist_path=watchlist_path,
+        output_path=output_path,
+    )
+    markdown = artifacts.markdown_path.read_text(encoding="utf-8")
+    payload = json.loads(artifacts.json_path.read_text(encoding="utf-8"))
+
+    assert f"- Source watchlist path: `{watchlist_path.as_posix()}`" in markdown
+    assert "- Latest watchlist category: `Mixed / Disagreement Candidates`" in markdown
+    assert payload["latest_watchlist_score"] == 3
+    assert "needs validation" in payload["disagreement_flags"]
+    _assert_repo_validation_outputs_unchanged(snapshot)
+
+
+def test_validation_checklist_missing_watchlist_file_warning(tmp_path: Path) -> None:
+    journal_path = tmp_path / "journal.csv"
+    missing_watchlist = tmp_path / "missing_watchlist.json"
+    output_path = tmp_path / "reports" / "validation_checklist_BB.md"
+    snapshot = _snapshot_repo_validation_outputs()
+    _write_journal_csv(
+        journal_path,
+        [_journal_row(ticker="BB", generated_at="2026-06-21T09:00:00", run_dir=tmp_path / "runs" / "bb")],
+    )
+
+    artifacts = build_validation_checklist(
+        ticker="BB",
+        journal_path=journal_path,
+        watchlist_path=missing_watchlist,
+        output_path=output_path,
+    )
+    markdown = artifacts.markdown_path.read_text(encoding="utf-8")
+
+    assert artifacts.warnings
+    assert "generating checklist from journal only" in markdown.lower()
+    _assert_repo_validation_outputs_unchanged(snapshot)
+
+
+def test_validation_checklist_missing_ticker_error(tmp_path: Path) -> None:
+    journal_path = tmp_path / "journal.csv"
+    _write_journal_csv(
+        journal_path,
+        [_journal_row(ticker="BB", generated_at="2026-06-21T09:00:00", run_dir=tmp_path / "runs" / "bb")],
+    )
+
+    with pytest.raises(SystemExit, match="Validation checklist mode requires --ticker."):
+        build_validation_checklist(ticker=None, journal_path=journal_path, output_path=tmp_path / "reports" / "validation.md")
+
+
+def test_validation_checklist_ticker_not_found_error(tmp_path: Path) -> None:
+    journal_path = tmp_path / "journal.csv"
+    _write_journal_csv(
+        journal_path,
+        [_journal_row(ticker="GME", generated_at="2026-06-21T09:00:00", run_dir=tmp_path / "runs" / "gme")],
+    )
+
+    with pytest.raises(SystemExit, match="Ticker `BB` was not found in research journal:"):
+        build_validation_checklist(ticker="BB", journal_path=journal_path, output_path=tmp_path / "reports" / "validation.md")
+
+
+def test_validation_checklist_missing_journal_error(tmp_path: Path) -> None:
+    missing_path = tmp_path / "missing.csv"
+
+    with pytest.raises(SystemExit, match="Research journal file not found:"):
+        build_validation_checklist(ticker="BB", journal_path=missing_path, output_path=tmp_path / "reports" / "validation.md")
+
+
+def test_validation_checklist_malformed_json_warning(tmp_path: Path) -> None:
+    journal_path = tmp_path / "journal.csv"
+    watchlist_path = tmp_path / "bad_watchlist.json"
+    output_path = tmp_path / "reports" / "validation_checklist_BB.md"
+    snapshot = _snapshot_repo_validation_outputs()
+    row = _journal_row(ticker="BB", generated_at="2026-06-21T09:00:00", run_dir=tmp_path / "runs" / "bb")
+    row["action_by_preset"] = '{"core":"buy"'
+    _write_journal_csv(journal_path, [row])
+    watchlist_path.write_text('{"per_ticker":[', encoding="utf-8")
+
+    artifacts = build_validation_checklist(
+        ticker="BB",
+        journal_path=journal_path,
+        watchlist_path=watchlist_path,
+        output_path=output_path,
+    )
+    markdown = artifacts.markdown_path.read_text(encoding="utf-8")
+    payload = json.loads(artifacts.json_path.read_text(encoding="utf-8"))
+
+    assert any("Malformed JSON in `action_by_preset`" in warning for warning in artifacts.warnings)
+    assert any("Malformed watchlist JSON" in warning for warning in artifacts.warnings)
+    assert "Malformed watchlist JSON" in markdown
+    assert payload["warnings"]
+    _assert_repo_validation_outputs_unchanged(snapshot)
+
+
+def test_validation_checklist_custom_output_path(tmp_path: Path) -> None:
+    journal_path = tmp_path / "journal.csv"
+    output_path = tmp_path / "custom" / "bb_checklist.md"
+    snapshot = _snapshot_repo_validation_outputs()
+    _write_journal_csv(
+        journal_path,
+        [_journal_row(ticker="BB", generated_at="2026-06-21T09:00:00", run_dir=tmp_path / "runs" / "bb")],
+    )
+
+    artifacts = build_validation_checklist(ticker="BB", journal_path=journal_path, output_path=output_path)
+
+    assert artifacts.markdown_path == output_path
+    assert artifacts.json_path == output_path.with_suffix(".json")
+    assert output_path.exists()
+    assert output_path.with_suffix(".json").exists()
+    _assert_repo_validation_outputs_unchanged(snapshot)
+
+
+def test_validation_checklist_mode_does_not_run_analyst_or_data_workflow(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    journal_path = tmp_path / "journal.csv"
+    output_path = tmp_path / "reports" / "validation_checklist_BB.md"
+    snapshot = _snapshot_repo_validation_outputs()
+    _write_journal_csv(
+        journal_path,
+        [_journal_row(ticker="BB", generated_at="2026-06-21T09:00:00", run_dir=tmp_path / "runs" / "bb")],
+    )
+
+    monkeypatch.setattr(
+        "src.basket_runner.run_basket",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("run_basket should not run in validation mode")),
+    )
+    monkeypatch.setattr(
+        "src.basket_runner.run_preset_comparison",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("preset comparison should not run in validation mode")),
+    )
+    monkeypatch.setattr(
+        "src.basket_runner.resolve_analysts_for_preset",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("analysts should not resolve in validation mode")),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "basket_runner.py",
+            "--validation-checklist",
+            "--ticker",
+            "BB",
+            "--research-journal-path",
+            str(journal_path),
+            "--validation-output",
+            str(output_path),
+        ],
+    )
+
+    assert main() == 0
+    assert output_path.exists()
+    assert output_path.with_suffix(".json").exists()
+    _assert_repo_validation_outputs_unchanged(snapshot)
+
+
+def test_record_human_review_creates_log_with_headers(tmp_path: Path) -> None:
+    journal_path = tmp_path / "journal.csv"
+    checklist_path = tmp_path / "validation_checklist_BB.json"
+    log_path = tmp_path / "human_review_log.csv"
+    snapshot = _snapshot_repo_human_review_logs()
+    _write_journal_csv(journal_path, [_journal_row(ticker="BB", generated_at="2026-06-21T09:00:00", run_dir=tmp_path / "runs" / "bb")])
+    checklist_path.write_text(
+        json.dumps(
+            {
+                "generated_at": "2026-06-25T09:00:00",
+                "ticker": "BB",
+                "source_journal_path": journal_path.as_posix(),
+                "source_watchlist_path": None,
+                "latest_research_packet_path": (tmp_path / "runs" / "bb" / "research_packet.md").as_posix(),
+                "latest_watchlist_category": "Watchlist",
+                "latest_watchlist_score": 1,
+                "latest_actions": {"core": "buy"},
+                "latest_consensus": {"core": "mixed"},
+                "disagreement_flags": ["needs current-data validation"],
+                "checklist_sections": [],
+                "warnings": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    artifacts = record_human_review(
+        ticker="BB",
+        human_status="Watchlist",
+        review_notes="Needs live-data check before deeper work.",
+        validation_checklist_path=checklist_path,
+        journal_path=journal_path,
+        human_review_log_path=log_path,
+    )
+    rows = list(csv.DictReader(log_path.open(encoding="utf-8", newline="")))
+    header_line = log_path.read_text(encoding="utf-8").splitlines()[0]
+
+    assert artifacts.log_path == log_path
+    assert artifacts.rows_written == 1
+    assert header_line.split(",") == HUMAN_REVIEW_LOG_FIELDNAMES
+    assert len(rows) == 1
+    assert rows[0]["ticker"] == "BB"
+    assert rows[0]["human_status"] == "Watchlist"
+    _assert_repo_human_review_logs_unchanged(snapshot)
+
+
+def test_record_human_review_second_append_does_not_duplicate_headers(tmp_path: Path) -> None:
+    journal_path = tmp_path / "journal.csv"
+    log_path = tmp_path / "human_review_log.csv"
+    snapshot = _snapshot_repo_human_review_logs()
+    _write_journal_csv(
+        journal_path,
+        [
+            _journal_row(ticker="BB", generated_at="2026-06-21T09:00:00", run_dir=tmp_path / "runs" / "bb"),
+            _journal_row(ticker="GME", generated_at="2026-06-21T10:00:00", run_dir=tmp_path / "runs" / "gme"),
+        ],
+    )
+
+    record_human_review(ticker="BB", human_status="Watchlist", journal_path=journal_path, human_review_log_path=log_path)
+    record_human_review(ticker="GME", human_status="Reject", journal_path=journal_path, human_review_log_path=log_path)
+
+    lines = log_path.read_text(encoding="utf-8").splitlines()
+    rows = list(csv.DictReader(log_path.open(encoding="utf-8", newline="")))
+
+    assert sum(1 for line in lines if line.startswith("reviewed_at,")) == 1
+    assert [row["ticker"] for row in rows] == ["BB", "GME"]
+    _assert_repo_human_review_logs_unchanged(snapshot)
+
+
+def test_record_human_review_custom_log_path_works(tmp_path: Path) -> None:
+    journal_path = tmp_path / "journal.csv"
+    log_path = tmp_path / "custom" / "human_review_log.csv"
+    snapshot = _snapshot_repo_human_review_logs()
+    _write_journal_csv(journal_path, [_journal_row(ticker="BB", generated_at="2026-06-21T09:00:00", run_dir=tmp_path / "runs" / "bb")])
+
+    artifacts = record_human_review(ticker="BB", human_status="Deep Research", journal_path=journal_path, human_review_log_path=log_path)
+
+    assert artifacts.log_path == log_path
+    assert log_path.exists()
+    _assert_repo_human_review_logs_unchanged(snapshot)
+
+
+@pytest.mark.parametrize("status", ["Watchlist", "Reject", "Deep Research", "Paper Trade Candidate", "Trade Candidate"])
+def test_record_human_review_allowed_statuses_work(tmp_path: Path, status: str) -> None:
+    journal_path = tmp_path / "journal.csv"
+    log_path = tmp_path / "human_review_log.csv"
+    snapshot = _snapshot_repo_human_review_logs()
+    _write_journal_csv(journal_path, [_journal_row(ticker="BB", generated_at="2026-06-21T09:00:00", run_dir=tmp_path / "runs" / "bb")])
+
+    artifacts = record_human_review(ticker="BB", human_status=status, journal_path=journal_path, human_review_log_path=log_path)
+    rows = list(csv.DictReader(log_path.open(encoding="utf-8", newline="")))
+
+    assert artifacts.human_status == status
+    assert rows[0]["human_status"] == status
+    _assert_repo_human_review_logs_unchanged(snapshot)
+
+
+def test_record_human_review_invalid_status_fails_clearly(tmp_path: Path) -> None:
+    journal_path = tmp_path / "journal.csv"
+    _write_journal_csv(journal_path, [_journal_row(ticker="BB", generated_at="2026-06-21T09:00:00", run_dir=tmp_path / "runs" / "bb")])
+
+    with pytest.raises(SystemExit, match="Invalid --human-status. Allowed values:"):
+        record_human_review(ticker="BB", human_status="Maybe", journal_path=journal_path, human_review_log_path=tmp_path / "human_review_log.csv")
+
+
+def test_record_human_review_missing_validation_checklist_warns_but_still_writes(tmp_path: Path) -> None:
+    journal_path = tmp_path / "journal.csv"
+    missing_checklist = tmp_path / "missing_validation_checklist.json"
+    log_path = tmp_path / "human_review_log.csv"
+    snapshot = _snapshot_repo_human_review_logs()
+    _write_journal_csv(journal_path, [_journal_row(ticker="BB", generated_at="2026-06-21T09:00:00", run_dir=tmp_path / "runs" / "bb")])
+
+    artifacts = record_human_review(
+        ticker="BB",
+        human_status="Watchlist",
+        validation_checklist_path=missing_checklist,
+        journal_path=journal_path,
+        human_review_log_path=log_path,
+    )
+    rows = list(csv.DictReader(log_path.open(encoding="utf-8", newline="")))
+
+    assert artifacts.warnings
+    assert any("Validation checklist JSON not found" in warning for warning in artifacts.warnings)
+    assert len(rows) == 1
+    _assert_repo_human_review_logs_unchanged(snapshot)
+
+
+def test_record_human_review_missing_watchlist_path_warns_but_still_writes(tmp_path: Path) -> None:
+    journal_path = tmp_path / "journal.csv"
+    missing_watchlist = tmp_path / "missing_watchlist.json"
+    log_path = tmp_path / "human_review_log.csv"
+    snapshot = _snapshot_repo_human_review_logs()
+    _write_journal_csv(journal_path, [_journal_row(ticker="BB", generated_at="2026-06-21T09:00:00", run_dir=tmp_path / "runs" / "bb")])
+
+    artifacts = record_human_review(
+        ticker="BB",
+        human_status="Watchlist",
+        journal_path=journal_path,
+        watchlist_path=missing_watchlist,
+        human_review_log_path=log_path,
+    )
+    rows = list(csv.DictReader(log_path.open(encoding="utf-8", newline="")))
+
+    assert any("Research watchlist JSON not found" in warning for warning in artifacts.warnings)
+    assert len(rows) == 1
+    _assert_repo_human_review_logs_unchanged(snapshot)
+
+
+def test_record_human_review_context_is_pulled_from_validation_checklist_json_when_available(tmp_path: Path) -> None:
+    journal_path = tmp_path / "journal.csv"
+    checklist_path = tmp_path / "validation_checklist_BB.json"
+    log_path = tmp_path / "human_review_log.csv"
+    snapshot = _snapshot_repo_human_review_logs()
+    _write_journal_csv(journal_path, [_journal_row(ticker="BB", generated_at="2026-06-21T09:00:00", run_dir=tmp_path / "runs" / "bb")])
+    checklist_path.write_text(
+        json.dumps(
+            {
+                "generated_at": "2026-06-25T09:00:00",
+                "ticker": "BB",
+                "source_journal_path": journal_path.as_posix(),
+                "source_watchlist_path": "outputs/research_watchlist.json",
+                "latest_research_packet_path": "outputs/ras_ollama_basket_runs/demo/research_packet.md",
+                "latest_watchlist_category": "Mixed / Disagreement Candidates",
+                "latest_watchlist_score": 2,
+                "latest_actions": {"technical-only": "buy", "core": "buy"},
+                "latest_consensus": {"technical-only": "bullish", "core": "mixed"},
+                "disagreement_flags": ["comparison notes present"],
+                "checklist_sections": [],
+                "warnings": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    record_human_review(
+        ticker="BB",
+        human_status="Deep Research",
+        validation_checklist_path=checklist_path,
+        journal_path=journal_path,
+        human_review_log_path=log_path,
+    )
+    row = next(csv.DictReader(log_path.open(encoding="utf-8", newline="")))
+
+    assert row["latest_research_packet_path"] == "outputs/ras_ollama_basket_runs/demo/research_packet.md"
+    assert row["latest_watchlist_category"] == "Mixed / Disagreement Candidates"
+    assert row["latest_watchlist_score"] == "2"
+    assert json.loads(row["latest_actions"])["technical-only"] == "buy"
+    _assert_repo_human_review_logs_unchanged(snapshot)
+
+
+def test_record_human_review_json_list_fields_are_valid_json_strings(tmp_path: Path) -> None:
+    journal_path = tmp_path / "journal.csv"
+    log_path = tmp_path / "human_review_log.csv"
+    snapshot = _snapshot_repo_human_review_logs()
+    _write_journal_csv(journal_path, [_journal_row(ticker="BB", generated_at="2026-06-21T09:00:00", run_dir=tmp_path / "runs" / "bb")])
+
+    record_human_review(ticker="BB", human_status="Watchlist", journal_path=journal_path, human_review_log_path=log_path)
+    row = next(csv.DictReader(log_path.open(encoding="utf-8", newline="")))
+
+    assert isinstance(json.loads(row["latest_actions"]), dict)
+    assert isinstance(json.loads(row["latest_consensus"]), dict)
+    assert isinstance(json.loads(row["disagreement_flags"]), list)
+    _assert_repo_human_review_logs_unchanged(snapshot)
+
+
+def test_record_human_review_mode_does_not_run_analyst_or_data_workflow(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    journal_path = tmp_path / "journal.csv"
+    checklist_path = tmp_path / "validation_checklist_BB.json"
+    log_path = tmp_path / "human_review_log.csv"
+    snapshot = _snapshot_repo_human_review_logs()
+    _write_journal_csv(journal_path, [_journal_row(ticker="BB", generated_at="2026-06-21T09:00:00", run_dir=tmp_path / "runs" / "bb")])
+    checklist_path.write_text(
+        json.dumps(
+            {
+                "generated_at": "2026-06-25T09:00:00",
+                "ticker": "BB",
+                "source_journal_path": journal_path.as_posix(),
+                "source_watchlist_path": None,
+                "latest_research_packet_path": "",
+                "latest_watchlist_category": None,
+                "latest_watchlist_score": None,
+                "latest_actions": {"core": "buy"},
+                "latest_consensus": {"core": "mixed"},
+                "disagreement_flags": [],
+                "checklist_sections": [],
+                "warnings": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        "src.basket_runner.run_basket",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("run_basket should not run in record-human-review mode")),
+    )
+    monkeypatch.setattr(
+        "src.basket_runner.run_preset_comparison",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("preset comparison should not run in record-human-review mode")),
+    )
+    monkeypatch.setattr(
+        "src.basket_runner.resolve_analysts_for_preset",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("analysts should not resolve in record-human-review mode")),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "basket_runner.py",
+            "--record-human-review",
+            "--ticker",
+            "BB",
+            "--human-status",
+            "Watchlist",
+            "--validation-checklist-path",
+            str(checklist_path),
+            "--research-journal-path",
+            str(journal_path),
+            "--human-review-log-path",
+            str(log_path),
+        ],
+    )
+
+    assert main() == 0
+    assert log_path.exists()
+    _assert_repo_human_review_logs_unchanged(snapshot)
+
+
+def test_review_human_reviews_summary_for_all_tickers(tmp_path: Path) -> None:
+    log_path = tmp_path / "human_review_log.csv"
+    output_path = tmp_path / "reports" / "human_review_summary.md"
+    snapshot = _snapshot_repo_human_review_summary_outputs()
+    with log_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=HUMAN_REVIEW_LOG_FIELDNAMES)
+        writer.writeheader()
+        writer.writerows(
+            [
+                {
+                    "reviewed_at": "2026-06-25T09:00:00",
+                    "ticker": "BB",
+                    "human_status": "Watchlist",
+                    "review_notes": "Needs more work.",
+                    "validation_checklist_path": "outputs/validation_checklist_BB.json",
+                    "latest_research_packet_path": "outputs/bb_packet.md",
+                    "latest_watchlist_category": "Mixed / Disagreement Candidates",
+                    "latest_watchlist_score": "2",
+                    "latest_actions": json.dumps({"core": "buy"}),
+                    "latest_consensus": json.dumps({"core": "mixed"}),
+                    "disagreement_flags": json.dumps(["needs validation"]),
+                    "data_mode": "offline_demo",
+                    "offline_demo_warning": "Latest journal context reflects offline_demo data; current-data validation is still required.",
+                    "source_journal_path": "outputs/research_journal.csv",
+                    "source_watchlist_path": "outputs/research_watchlist.json",
+                },
+                {
+                    "reviewed_at": "2026-06-25T10:00:00",
+                    "ticker": "GME",
+                    "human_status": "Reject",
+                    "review_notes": "Current news invalidated setup.",
+                    "validation_checklist_path": "outputs/validation_checklist_GME.json",
+                    "latest_research_packet_path": "outputs/gme_packet.md",
+                    "latest_watchlist_category": "Bearish / Avoid For Now Candidates",
+                    "latest_watchlist_score": "-3",
+                    "latest_actions": json.dumps({"all": "sell"}),
+                    "latest_consensus": json.dumps({"all": "bearish"}),
+                    "disagreement_flags": json.dumps([]),
+                    "data_mode": "live",
+                    "offline_demo_warning": "",
+                    "source_journal_path": "outputs/research_journal.csv",
+                    "source_watchlist_path": "outputs/research_watchlist.json",
+                },
+            ]
+        )
+
+    artifacts = review_human_reviews(log_path=log_path, output_path=output_path)
+    markdown = artifacts.markdown_path.read_text(encoding="utf-8")
+    payload = json.loads(artifacts.json_path.read_text(encoding="utf-8"))
+
+    assert artifacts.markdown_path == output_path
+    assert artifacts.json_path == output_path.with_suffix(".json")
+    assert DECISION_SUMMARY_DISCLAIMER in markdown
+    assert f"- Source human review log path: `{log_path.as_posix()}`" in markdown
+    assert "- Scope: `All tickers`" in markdown
+    assert "## Latest Review Per Ticker" in markdown
+    assert "## Chronological Review History" in markdown
+    assert "## Follow-Up Buckets" in markdown
+    assert payload["total_review_rows"] == 2
+    assert payload["reviewed_ticker_count"] == 2
+    _assert_repo_human_review_summary_outputs_unchanged(snapshot)
+
+
+def test_review_human_reviews_summary_filtered_to_one_ticker(tmp_path: Path) -> None:
+    log_path = tmp_path / "human_review_log.csv"
+    output_path = tmp_path / "reports" / "human_review_summary_BB.md"
+    snapshot = _snapshot_repo_human_review_summary_outputs()
+    with log_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=HUMAN_REVIEW_LOG_FIELDNAMES)
+        writer.writeheader()
+        writer.writerows(
+            [
+                {
+                    "reviewed_at": "2026-06-25T09:00:00",
+                    "ticker": "BB",
+                    "human_status": "Watchlist",
+                    "review_notes": "Needs more work.",
+                    "validation_checklist_path": "outputs/validation_checklist_BB.json",
+                    "latest_research_packet_path": "outputs/bb_packet.md",
+                    "latest_watchlist_category": "Mixed / Disagreement Candidates",
+                    "latest_watchlist_score": "2",
+                    "latest_actions": json.dumps({"core": "buy"}),
+                    "latest_consensus": json.dumps({"core": "mixed"}),
+                    "disagreement_flags": json.dumps(["needs validation"]),
+                    "data_mode": "offline_demo",
+                    "offline_demo_warning": "",
+                    "source_journal_path": "outputs/research_journal.csv",
+                    "source_watchlist_path": "outputs/research_watchlist.json",
+                },
+                {
+                    "reviewed_at": "2026-06-25T10:00:00",
+                    "ticker": "GME",
+                    "human_status": "Reject",
+                    "review_notes": "Invalidated.",
+                    "validation_checklist_path": "outputs/validation_checklist_GME.json",
+                    "latest_research_packet_path": "outputs/gme_packet.md",
+                    "latest_watchlist_category": "Bearish / Avoid For Now Candidates",
+                    "latest_watchlist_score": "-3",
+                    "latest_actions": json.dumps({"all": "sell"}),
+                    "latest_consensus": json.dumps({"all": "bearish"}),
+                    "disagreement_flags": json.dumps([]),
+                    "data_mode": "live",
+                    "offline_demo_warning": "",
+                    "source_journal_path": "outputs/research_journal.csv",
+                    "source_watchlist_path": "outputs/research_watchlist.json",
+                },
+            ]
+        )
+
+    artifacts = review_human_reviews(log_path=log_path, ticker="BB", output_path=output_path)
+    payload = json.loads(artifacts.json_path.read_text(encoding="utf-8"))
+
+    assert artifacts.ticker == "BB"
+    assert payload["total_review_rows"] == 1
+    assert payload["reviewed_ticker_count"] == 1
+    assert payload["latest_review_per_ticker"][0]["ticker"] == "BB"
+    _assert_repo_human_review_summary_outputs_unchanged(snapshot)
+
+
+def test_review_human_reviews_custom_log_path(tmp_path: Path) -> None:
+    log_path = tmp_path / "custom" / "human_review_log.csv"
+    output_path = tmp_path / "reports" / "summary.md"
+    snapshot = _snapshot_repo_human_review_summary_outputs()
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=HUMAN_REVIEW_LOG_FIELDNAMES)
+        writer.writeheader()
+
+    artifacts = review_human_reviews(log_path=log_path, output_path=output_path)
+
+    assert artifacts.log_path == log_path
+    assert artifacts.markdown_path == output_path
+    _assert_repo_human_review_summary_outputs_unchanged(snapshot)
+
+
+def test_review_human_reviews_custom_output_path(tmp_path: Path) -> None:
+    log_path = tmp_path / "human_review_log.csv"
+    output_path = tmp_path / "custom" / "summary.md"
+    snapshot = _snapshot_repo_human_review_summary_outputs()
+    with log_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=HUMAN_REVIEW_LOG_FIELDNAMES)
+        writer.writeheader()
+
+    artifacts = review_human_reviews(log_path=log_path, output_path=output_path)
+
+    assert artifacts.markdown_path == output_path
+    assert artifacts.json_path == output_path.with_suffix(".json")
+    assert output_path.exists()
+    assert output_path.with_suffix(".json").exists()
+    _assert_repo_human_review_summary_outputs_unchanged(snapshot)
+
+
+def test_review_human_reviews_counts_by_human_status(tmp_path: Path) -> None:
+    log_path = tmp_path / "human_review_log.csv"
+    output_path = tmp_path / "summary.md"
+    snapshot = _snapshot_repo_human_review_summary_outputs()
+    with log_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=HUMAN_REVIEW_LOG_FIELDNAMES)
+        writer.writeheader()
+        for idx, status in enumerate(["Watchlist", "Reject", "Deep Research", "Paper Trade Candidate", "Trade Candidate"], start=1):
+            writer.writerow(
+                {
+                    "reviewed_at": f"2026-06-25T0{idx}:00:00",
+                    "ticker": f"T{idx}",
+                    "human_status": status,
+                    "review_notes": "",
+                    "validation_checklist_path": "",
+                    "latest_research_packet_path": "",
+                    "latest_watchlist_category": "",
+                    "latest_watchlist_score": "",
+                    "latest_actions": json.dumps({}),
+                    "latest_consensus": json.dumps({}),
+                    "disagreement_flags": json.dumps([]),
+                    "data_mode": "",
+                    "offline_demo_warning": "",
+                    "source_journal_path": "",
+                    "source_watchlist_path": "",
+                }
+            )
+
+    payload = json.loads(review_human_reviews(log_path=log_path, output_path=output_path).json_path.read_text(encoding="utf-8"))
+
+    assert payload["counts_by_human_status"]["Watchlist"] == 1
+    assert payload["counts_by_human_status"]["Reject"] == 1
+    assert payload["counts_by_human_status"]["Deep Research"] == 1
+    assert payload["counts_by_human_status"]["Paper Trade Candidate"] == 1
+    assert payload["counts_by_human_status"]["Trade Candidate"] == 1
+    _assert_repo_human_review_summary_outputs_unchanged(snapshot)
+
+
+def test_review_human_reviews_latest_review_per_ticker_picks_most_recent_row(tmp_path: Path) -> None:
+    log_path = tmp_path / "human_review_log.csv"
+    output_path = tmp_path / "summary.md"
+    snapshot = _snapshot_repo_human_review_summary_outputs()
+    with log_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=HUMAN_REVIEW_LOG_FIELDNAMES)
+        writer.writeheader()
+        writer.writerows(
+            [
+                {
+                    "reviewed_at": "2026-06-25T09:00:00",
+                    "ticker": "BB",
+                    "human_status": "Watchlist",
+                    "review_notes": "Older note",
+                    "validation_checklist_path": "older.json",
+                    "latest_research_packet_path": "",
+                    "latest_watchlist_category": "",
+                    "latest_watchlist_score": "",
+                    "latest_actions": json.dumps({"core": "buy"}),
+                    "latest_consensus": json.dumps({"core": "mixed"}),
+                    "disagreement_flags": json.dumps([]),
+                    "data_mode": "",
+                    "offline_demo_warning": "",
+                    "source_journal_path": "",
+                    "source_watchlist_path": "",
+                },
+                {
+                    "reviewed_at": "2026-06-25T10:00:00",
+                    "ticker": "BB",
+                    "human_status": "Deep Research",
+                    "review_notes": "Newer note",
+                    "validation_checklist_path": "newer.json",
+                    "latest_research_packet_path": "",
+                    "latest_watchlist_category": "",
+                    "latest_watchlist_score": "",
+                    "latest_actions": json.dumps({"core": "buy"}),
+                    "latest_consensus": json.dumps({"core": "bullish"}),
+                    "disagreement_flags": json.dumps([]),
+                    "data_mode": "",
+                    "offline_demo_warning": "",
+                    "source_journal_path": "",
+                    "source_watchlist_path": "",
+                },
+            ]
+        )
+
+    payload = json.loads(review_human_reviews(log_path=log_path, output_path=output_path).json_path.read_text(encoding="utf-8"))
+    latest = payload["latest_review_per_ticker"][0]
+
+    assert latest["latest_human_status"] == "Deep Research"
+    assert latest["latest_review_notes"] == "Newer note"
+    assert latest["validation_checklist_path"] == "newer.json"
+    _assert_repo_human_review_summary_outputs_unchanged(snapshot)
+
+
+def test_review_human_reviews_follow_up_buckets_group_latest_statuses_correctly(tmp_path: Path) -> None:
+    log_path = tmp_path / "human_review_log.csv"
+    output_path = tmp_path / "summary.md"
+    snapshot = _snapshot_repo_human_review_summary_outputs()
+    with log_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=HUMAN_REVIEW_LOG_FIELDNAMES)
+        writer.writeheader()
+        rows = [
+            ("BB", "Watchlist"),
+            ("GME", "Reject"),
+            ("AAPL", "Deep Research"),
+            ("MSFT", "Paper Trade Candidate"),
+            ("NVDA", "Trade Candidate"),
+        ]
+        for idx, (ticker_value, status) in enumerate(rows, start=1):
+            writer.writerow(
+                {
+                    "reviewed_at": f"2026-06-25T0{idx}:00:00",
+                    "ticker": ticker_value,
+                    "human_status": status,
+                    "review_notes": "",
+                    "validation_checklist_path": "",
+                    "latest_research_packet_path": "",
+                    "latest_watchlist_category": "",
+                    "latest_watchlist_score": "",
+                    "latest_actions": json.dumps({}),
+                    "latest_consensus": json.dumps({}),
+                    "disagreement_flags": json.dumps([]),
+                    "data_mode": "",
+                    "offline_demo_warning": "",
+                    "source_journal_path": "",
+                    "source_watchlist_path": "",
+                }
+            )
+
+    payload = json.loads(review_human_reviews(log_path=log_path, output_path=output_path).json_path.read_text(encoding="utf-8"))
+
+    assert payload["follow_up_buckets"]["Active Watchlist"] == ["BB"]
+    assert payload["follow_up_buckets"]["Rejected"] == ["GME"]
+    assert payload["follow_up_buckets"]["Deep Research Queue"] == ["AAPL"]
+    assert payload["follow_up_buckets"]["Paper Trade Candidates"] == ["MSFT"]
+    assert payload["follow_up_buckets"]["Trade Candidates"] == ["NVDA"]
+    _assert_repo_human_review_summary_outputs_unchanged(snapshot)
+
+
+def test_review_human_reviews_malformed_json_warning(tmp_path: Path) -> None:
+    log_path = tmp_path / "human_review_log.csv"
+    output_path = tmp_path / "summary.md"
+    snapshot = _snapshot_repo_human_review_summary_outputs()
+    with log_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=HUMAN_REVIEW_LOG_FIELDNAMES)
+        writer.writeheader()
+        writer.writerow(
+            {
+                "reviewed_at": "2026-06-25T09:00:00",
+                "ticker": "BB",
+                "human_status": "Watchlist",
+                "review_notes": "",
+                "validation_checklist_path": "",
+                "latest_research_packet_path": "",
+                "latest_watchlist_category": "",
+                "latest_watchlist_score": "",
+                "latest_actions": '{"core":"buy"',
+                "latest_consensus": json.dumps({"core": "mixed"}),
+                "disagreement_flags": json.dumps([]),
+                "data_mode": "",
+                "offline_demo_warning": "",
+                "source_journal_path": "",
+                "source_watchlist_path": "",
+            }
+        )
+
+    artifacts = review_human_reviews(log_path=log_path, output_path=output_path)
+    markdown = artifacts.markdown_path.read_text(encoding="utf-8")
+
+    assert artifacts.warnings
+    assert "Malformed JSON in `latest_actions`" in markdown
+    _assert_repo_human_review_summary_outputs_unchanged(snapshot)
+
+
+def test_review_human_reviews_missing_log_error(tmp_path: Path) -> None:
+    missing_path = tmp_path / "missing.csv"
+
+    with pytest.raises(SystemExit, match="Human review log file not found:"):
+        review_human_reviews(log_path=missing_path, output_path=tmp_path / "summary.md")
+
+
+def test_review_human_reviews_empty_log_report(tmp_path: Path) -> None:
+    log_path = tmp_path / "human_review_log.csv"
+    output_path = tmp_path / "summary.md"
+    snapshot = _snapshot_repo_human_review_summary_outputs()
+    with log_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=HUMAN_REVIEW_LOG_FIELDNAMES)
+        writer.writeheader()
+
+    artifacts = review_human_reviews(log_path=log_path, output_path=output_path)
+    markdown = artifacts.markdown_path.read_text(encoding="utf-8")
+    payload = json.loads(artifacts.json_path.read_text(encoding="utf-8"))
+
+    assert artifacts.rows_reviewed == 0
+    assert artifacts.reviewed_ticker_count == 0
+    assert "- Total review rows: `0`" in markdown
+    assert payload["total_review_rows"] == 0
+    assert payload["reviewed_ticker_count"] == 0
+    _assert_repo_human_review_summary_outputs_unchanged(snapshot)
+
+
+def test_review_human_reviews_mode_does_not_run_analyst_data_workflow_or_append_anything(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    log_path = tmp_path / "human_review_log.csv"
+    output_path = tmp_path / "summary.md"
+    snapshot = _snapshot_repo_human_review_summary_outputs()
+    with log_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=HUMAN_REVIEW_LOG_FIELDNAMES)
+        writer.writeheader()
+        writer.writerow(
+            {
+                "reviewed_at": "2026-06-25T09:00:00",
+                "ticker": "BB",
+                "human_status": "Watchlist",
+                "review_notes": "",
+                "validation_checklist_path": "",
+                "latest_research_packet_path": "",
+                "latest_watchlist_category": "",
+                "latest_watchlist_score": "",
+                "latest_actions": json.dumps({}),
+                "latest_consensus": json.dumps({}),
+                "disagreement_flags": json.dumps([]),
+                "data_mode": "",
+                "offline_demo_warning": "",
+                "source_journal_path": "",
+                "source_watchlist_path": "",
+            }
+        )
+    original_log_bytes = log_path.read_bytes()
+
+    monkeypatch.setattr(
+        "src.basket_runner.run_basket",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("run_basket should not run in review-human-reviews mode")),
+    )
+    monkeypatch.setattr(
+        "src.basket_runner.run_preset_comparison",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("preset comparison should not run in review-human-reviews mode")),
+    )
+    monkeypatch.setattr(
+        "src.basket_runner.resolve_analysts_for_preset",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("analysts should not resolve in review-human-reviews mode")),
+    )
+    monkeypatch.setattr(
+        "src.basket_runner.record_human_review",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("record_human_review should not run in review-human-reviews mode")),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "basket_runner.py",
+            "--review-human-reviews",
+            "--human-review-log-path",
+            str(log_path),
+            "--human-review-summary-output",
+            str(output_path),
+        ],
+    )
+
+    assert main() == 0
+    assert output_path.exists()
+    assert log_path.read_bytes() == original_log_bytes
+    _assert_repo_human_review_summary_outputs_unchanged(snapshot)
 
 
 def test_main_without_compare_presets_keeps_single_preset_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

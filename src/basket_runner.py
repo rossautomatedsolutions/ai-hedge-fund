@@ -14,6 +14,31 @@ from src.cli.input import resolve_dates
 from src.data_diagnostics import format_ticker_data_check, run_ticker_data_check, ticker_data_check_to_dict
 from src.main import run_hedge_fund
 from src.offline_demo_data import OFFLINE_DEMO_DATA_STATUS, OFFLINE_DEMO_DISCLAIMER
+from src.research_workflows import (
+    DECISION_SUMMARY_DISCLAIMER,
+    HUMAN_REVIEW_LOG_FIELDNAMES,
+    HUMAN_REVIEW_STATUSES,
+    RESEARCH_JOURNAL_FIELDNAMES,
+    HumanReviewLogArtifacts,
+    HumanReviewSummaryArtifacts,
+    ResearchJournalArtifacts,
+    ResearchJournalReviewArtifacts,
+    ResearchPacketArtifacts,
+    ResearchWatchlistArtifacts,
+    ValidationChecklistArtifacts,
+    _csv_row_list,
+    _json_cell,
+    _stringify_reasoning,
+    _write_json,
+    append_research_journal,
+    build_research_watchlist,
+    build_validation_checklist,
+    record_human_review,
+    review_human_reviews,
+    review_research_journal,
+    write_research_packet,
+)
+from src.research_workflows.common import _default_research_journal_path
 from src.utils.analysts import ANALYST_ORDER
 from src.utils.display import print_trading_output
 from src.utils.ollama import ensure_ollama_and_model
@@ -96,33 +121,6 @@ DECISION_CSV_FIELDNAMES = [
     "neutral_count",
     "run_status",
 ]
-DECISION_SUMMARY_DISCLAIMER = (
-    "Educational use only. This report is not financial advice, not an offer to buy or sell securities, "
-    "and not a recommendation to take any trading action."
-)
-RESEARCH_JOURNAL_FIELDNAMES = [
-    "generated_at",
-    "ticker",
-    "model",
-    "data_mode",
-    "offline_demo_data",
-    "run_dir",
-    "presets_analyzed",
-    "action_by_preset",
-    "confidence_by_preset",
-    "consensus_by_preset",
-    "comparison_notes",
-    "bull_case",
-    "bear_case",
-    "key_disagreement_points",
-    "data_limitations",
-    "what_to_check_next_manually",
-    "notable_risks_or_reasons_not_to_act",
-    "research_packet_md_path",
-    "research_packet_json_path",
-]
-
-
 def _parse_tickers(raw_tickers: str | None) -> list[str]:
     if not raw_tickers:
         return []
@@ -203,39 +201,6 @@ class PresetComparisonArtifacts:
     preset_run_dirs: dict[str, str]
 
 
-@dataclass
-class ResearchPacketArtifacts:
-    markdown_path: Path
-    json_path: Path
-    payload: dict[str, Any]
-
-
-@dataclass
-class ResearchJournalArtifacts:
-    journal_path: Path
-    rows_written: int
-
-
-@dataclass
-class ResearchJournalReviewArtifacts:
-    journal_path: Path
-    markdown_path: Path
-    json_path: Path
-    ticker: str | None
-    entries_reviewed: int
-    warnings: list[str]
-
-
-@dataclass
-class ResearchWatchlistArtifacts:
-    journal_path: Path
-    markdown_path: Path
-    json_path: Path
-    rows_reviewed: int
-    ticker_count: int
-    warnings: list[str]
-
-
 def resolve_analysts_for_preset(preset: str) -> list[str]:
     all_analysts = [analyst_key for _, analyst_key in ANALYST_ORDER]
     if preset == "all":
@@ -286,684 +251,6 @@ def resolve_data_request_options(
         "max_data_retries": max_data_retries,
         "skip_optional_slow_data": False,
     }
-
-
-def _write_json(path: Path, payload: Any) -> None:
-    path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
-
-
-def _csv_row_list(path: Path) -> list[dict[str, str]]:
-    if not path.exists():
-        return []
-    with path.open(encoding="utf-8", newline="") as handle:
-        return list(csv.DictReader(handle))
-
-
-def _json_cell(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=True, separators=(",", ":"))
-
-
-def _default_research_journal_path() -> Path:
-    return Path("outputs") / "research_journal.csv"
-
-
-def _default_research_journal_review_markdown_path(ticker: str | None = None) -> Path:
-    if ticker:
-        return Path("outputs") / f"research_journal_review_{ticker.upper()}.md"
-    return Path("outputs") / "research_journal_review.md"
-
-
-def _default_research_watchlist_markdown_path() -> Path:
-    return Path("outputs") / "research_watchlist.md"
-
-
-def _research_journal_rows_from_payload(
-    payload: dict[str, Any],
-    *,
-    research_packet_md_path: Path,
-    research_packet_json_path: Path,
-) -> list[dict[str, str]]:
-    rows: list[dict[str, str]] = []
-    for ticker_packet in payload.get("tickers", []):
-        rows.append(
-            {
-                "generated_at": str(payload.get("generated_at") or ""),
-                "ticker": str(ticker_packet.get("ticker") or ""),
-                "model": str(ticker_packet.get("model") or payload.get("model") or ""),
-                "data_mode": str(ticker_packet.get("data_mode") or payload.get("data_mode") or ""),
-                "offline_demo_data": str(bool(payload.get("offline_demo_data"))),
-                "run_dir": str(payload.get("run_dir") or ""),
-                "presets_analyzed": _json_cell(ticker_packet.get("presets_analyzed") or []),
-                "action_by_preset": _json_cell(ticker_packet.get("action_by_preset") or {}),
-                "confidence_by_preset": _json_cell(ticker_packet.get("confidence_by_preset") or {}),
-                "consensus_by_preset": _json_cell(ticker_packet.get("consensus_by_preset") or {}),
-                "comparison_notes": _json_cell(ticker_packet.get("comparison_notes") or []),
-                "bull_case": str(ticker_packet.get("bull_case") or ""),
-                "bear_case": str(ticker_packet.get("bear_case") or ""),
-                "key_disagreement_points": _json_cell(ticker_packet.get("key_disagreement_points") or []),
-                "data_limitations": _json_cell(ticker_packet.get("data_limitations") or []),
-                "what_to_check_next_manually": _json_cell(ticker_packet.get("what_to_check_next_manually") or []),
-                "notable_risks_or_reasons_not_to_act": _json_cell(
-                    ticker_packet.get("notable_risks_or_reasons_not_to_act") or []
-                ),
-                "research_packet_md_path": research_packet_md_path.as_posix(),
-                "research_packet_json_path": research_packet_json_path.as_posix(),
-            }
-        )
-    return rows
-
-
-def append_research_journal(
-    artifacts: ResearchPacketArtifacts,
-    *,
-    journal_path: Path | str | None = None,
-) -> ResearchJournalArtifacts:
-    target_path = Path(journal_path) if journal_path else _default_research_journal_path()
-    target_path.parent.mkdir(parents=True, exist_ok=True)
-    rows = _research_journal_rows_from_payload(
-        artifacts.payload,
-        research_packet_md_path=artifacts.markdown_path,
-        research_packet_json_path=artifacts.json_path,
-    )
-    write_header = not target_path.exists() or target_path.stat().st_size == 0
-    with target_path.open("a", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=RESEARCH_JOURNAL_FIELDNAMES)
-        if write_header:
-            writer.writeheader()
-        writer.writerows(rows)
-    return ResearchJournalArtifacts(journal_path=target_path, rows_written=len(rows))
-
-
-def _parse_json_cell(value: str, *, cell_name: str, ticker: str, generated_at: str, warnings: list[str]) -> Any:
-    raw_value = (value or "").strip()
-    if not raw_value:
-        return None
-    try:
-        return json.loads(raw_value)
-    except json.JSONDecodeError:
-        warnings.append(
-            f"Malformed JSON in `{cell_name}` for `{ticker or 'UNKNOWN'}` at `{generated_at or 'unknown time'}`; raw value shown."
-        )
-        return {"_raw": value, "_malformed": True}
-
-
-def _as_list_of_strings(value: Any) -> list[str]:
-    if value is None:
-        return []
-    if isinstance(value, list):
-        return [str(item).strip() for item in value if str(item).strip()]
-    if isinstance(value, dict):
-        return [f"{key}: {val}" for key, val in value.items() if str(key).strip() or str(val).strip()]
-    text = str(value).strip()
-    return [text] if text else []
-
-
-def _as_dict_of_strings(value: Any) -> dict[str, str]:
-    if not isinstance(value, dict):
-        return {}
-    normalized: dict[str, str] = {}
-    for key, item in value.items():
-        key_text = str(key).strip()
-        item_text = str(item).strip()
-        if key_text:
-            normalized[key_text] = item_text
-    return normalized
-
-
-def _normalize_theme_items(value: Any) -> list[str]:
-    if value is None:
-        return []
-    if isinstance(value, list):
-        items = value
-    else:
-        text = str(value).replace("\r", "\n")
-        for separator in (";", "|"):
-            text = text.replace(separator, "\n")
-        items = [part for line in text.split("\n") for part in line.split(" - ")]
-    normalized: list[str] = []
-    for item in items:
-        text = str(item).strip(" -\t")
-        if text:
-            normalized.append(text)
-    return normalized
-
-
-def _summarize_mapping(value: Any) -> str:
-    mapping = _as_dict_of_strings(value)
-    if mapping:
-        return ", ".join(f"{key}: {val}" for key, val in sorted(mapping.items()))
-    if isinstance(value, dict):
-        return json.dumps(value, ensure_ascii=True, separators=(",", ":"))
-    text = str(value or "").strip()
-    return text or "-"
-
-
-def _summarize_notes(value: Any) -> str:
-    items = _as_list_of_strings(value)
-    if items:
-        return "; ".join(items)
-    if isinstance(value, dict):
-        return json.dumps(value, ensure_ascii=True, separators=(",", ":"))
-    text = str(value or "").strip()
-    return text or "-"
-
-
-def _theme_counts(values: list[Any]) -> list[dict[str, Any]]:
-    counts: dict[str, int] = {}
-    first_seen: dict[str, int] = {}
-    for idx, value in enumerate(values):
-        seen_in_entry: set[str] = set()
-        for item in _normalize_theme_items(value):
-            normalized = item.lower()
-            if normalized in seen_in_entry:
-                continue
-            seen_in_entry.add(normalized)
-            counts[normalized] = counts.get(normalized, 0) + 1
-            first_seen.setdefault(normalized, idx)
-    ordered = sorted(counts.items(), key=lambda item: (-item[1], first_seen[item[0]], item[0]))
-    return [{"theme": theme, "count": count} for theme, count in ordered]
-
-
-def _display_theme_counts(values: list[Any]) -> list[str]:
-    themes = _theme_counts(values)
-    if not themes:
-        return ["None noted."]
-    return [f"{entry['theme']} ({entry['count']}x)" for entry in themes]
-
-
-def _safe_generated_sort_key(value: str) -> tuple[int, str]:
-    try:
-        return (0, datetime.fromisoformat(value.replace("Z", "+00:00")).isoformat())
-    except ValueError:
-        return (1, value)
-
-
-def _journal_review_output_paths(
-    *,
-    ticker: str | None,
-    output_path: Path | str | None,
-) -> tuple[Path, Path]:
-    markdown_path = Path(output_path) if output_path else _default_research_journal_review_markdown_path(ticker)
-    json_path = markdown_path.with_suffix(".json")
-    return markdown_path, json_path
-
-
-def _watchlist_output_paths(output_path: Path | str | None) -> tuple[Path, Path]:
-    markdown_path = Path(output_path) if output_path else _default_research_watchlist_markdown_path()
-    json_path = markdown_path.with_suffix(".json")
-    return markdown_path, json_path
-
-
-def _parsed_research_journal_rows(
-    *,
-    journal_path: Path | str | None = None,
-    ticker: str | None = None,
-) -> tuple[Path, list[dict[str, Any]], list[str]]:
-    target_journal_path = Path(journal_path) if journal_path else _default_research_journal_path()
-    if not target_journal_path.exists():
-        raise SystemExit(f"Research journal file not found: {target_journal_path.as_posix()}")
-
-    warnings: list[str] = []
-    parsed_rows: list[dict[str, Any]] = []
-    ticker_filter = ticker.upper() if ticker else None
-
-    with target_journal_path.open(encoding="utf-8", newline="") as handle:
-        for raw_row in csv.DictReader(handle):
-            row_ticker = str(raw_row.get("ticker") or "").strip().upper()
-            if ticker_filter and row_ticker != ticker_filter:
-                continue
-            generated_at = str(raw_row.get("generated_at") or "").strip()
-            parsed_row = {
-                "generated_at": generated_at,
-                "ticker": row_ticker,
-                "model": str(raw_row.get("model") or "").strip(),
-                "data_mode": str(raw_row.get("data_mode") or "").strip(),
-                "offline_demo_data": str(raw_row.get("offline_demo_data") or "").strip(),
-                "run_dir": str(raw_row.get("run_dir") or "").strip(),
-                "presets_analyzed": _parse_json_cell(
-                    str(raw_row.get("presets_analyzed") or ""),
-                    cell_name="presets_analyzed",
-                    ticker=row_ticker,
-                    generated_at=generated_at,
-                    warnings=warnings,
-                ),
-                "action_by_preset": _parse_json_cell(
-                    str(raw_row.get("action_by_preset") or ""),
-                    cell_name="action_by_preset",
-                    ticker=row_ticker,
-                    generated_at=generated_at,
-                    warnings=warnings,
-                ),
-                "confidence_by_preset": _parse_json_cell(
-                    str(raw_row.get("confidence_by_preset") or ""),
-                    cell_name="confidence_by_preset",
-                    ticker=row_ticker,
-                    generated_at=generated_at,
-                    warnings=warnings,
-                ),
-                "consensus_by_preset": _parse_json_cell(
-                    str(raw_row.get("consensus_by_preset") or ""),
-                    cell_name="consensus_by_preset",
-                    ticker=row_ticker,
-                    generated_at=generated_at,
-                    warnings=warnings,
-                ),
-                "comparison_notes": _parse_json_cell(
-                    str(raw_row.get("comparison_notes") or ""),
-                    cell_name="comparison_notes",
-                    ticker=row_ticker,
-                    generated_at=generated_at,
-                    warnings=warnings,
-                ),
-                "bull_case": str(raw_row.get("bull_case") or "").strip(),
-                "bear_case": str(raw_row.get("bear_case") or "").strip(),
-                "key_disagreement_points": _parse_json_cell(
-                    str(raw_row.get("key_disagreement_points") or ""),
-                    cell_name="key_disagreement_points",
-                    ticker=row_ticker,
-                    generated_at=generated_at,
-                    warnings=warnings,
-                ),
-                "data_limitations": _parse_json_cell(
-                    str(raw_row.get("data_limitations") or ""),
-                    cell_name="data_limitations",
-                    ticker=row_ticker,
-                    generated_at=generated_at,
-                    warnings=warnings,
-                ),
-                "what_to_check_next_manually": _parse_json_cell(
-                    str(raw_row.get("what_to_check_next_manually") or ""),
-                    cell_name="what_to_check_next_manually",
-                    ticker=row_ticker,
-                    generated_at=generated_at,
-                    warnings=warnings,
-                ),
-                "notable_risks_or_reasons_not_to_act": _parse_json_cell(
-                    str(raw_row.get("notable_risks_or_reasons_not_to_act") or ""),
-                    cell_name="notable_risks_or_reasons_not_to_act",
-                    ticker=row_ticker,
-                    generated_at=generated_at,
-                    warnings=warnings,
-                ),
-                "research_packet_md_path": str(raw_row.get("research_packet_md_path") or "").strip(),
-                "research_packet_json_path": str(raw_row.get("research_packet_json_path") or "").strip(),
-            }
-            parsed_rows.append(parsed_row)
-
-    parsed_rows.sort(key=lambda row: (_safe_generated_sort_key(str(row.get("generated_at") or "")), str(row.get("ticker") or "")))
-    return target_journal_path, parsed_rows, warnings
-
-
-def review_research_journal(
-    *,
-    journal_path: Path | str | None = None,
-    ticker: str | None = None,
-    output_path: Path | str | None = None,
-) -> ResearchJournalReviewArtifacts:
-    ticker_filter = ticker.upper() if ticker else None
-    target_journal_path, parsed_rows, warnings = _parsed_research_journal_rows(journal_path=journal_path, ticker=ticker_filter)
-    markdown_path, json_path = _journal_review_output_paths(ticker=ticker_filter, output_path=output_path)
-    markdown_path.parent.mkdir(parents=True, exist_ok=True)
-
-    latest_entry = parsed_rows[-1] if parsed_rows else None
-    scope_text = ticker_filter if ticker_filter else "All tickers"
-    generated_at = datetime.now().isoformat(timespec="seconds")
-    grouped: dict[str, list[dict[str, Any]]] = {}
-    for row in parsed_rows:
-        grouped.setdefault(str(row.get("ticker") or "UNKNOWN"), []).append(row)
-
-    lines = [
-        "# Research Journal Review",
-        "",
-        DECISION_SUMMARY_DISCLAIMER,
-        "",
-        f"- Source journal path: `{target_journal_path.as_posix()}`",
-        f"- Generated timestamp: `{generated_at}`",
-        f"- Scope: `{scope_text}`",
-        f"- Journal entries reviewed: `{len(parsed_rows)}`",
-        f"- Latest run directory: `{str((latest_entry or {}).get('run_dir') or 'N/A')}`",
-        f"- Latest research_packet.md path: `{str((latest_entry or {}).get('research_packet_md_path') or 'N/A')}`",
-        f"- Latest research_packet.json path: `{str((latest_entry or {}).get('research_packet_json_path') or 'N/A')}`",
-    ]
-    if warnings:
-        lines.extend(["", "## Warnings"])
-        for warning in warnings:
-            lines.append(f"- {warning}")
-
-    for ticker_key in sorted(grouped):
-        ticker_rows = grouped[ticker_key]
-        latest_ticker_row = ticker_rows[-1]
-        lines.extend(
-            [
-                "",
-                f"## {ticker_key}",
-                "",
-                "| Generated At | Model | Data Mode | Action By Preset | Consensus By Preset | Comparison Notes | Research Packet |",
-                "| --- | --- | --- | --- | --- | --- | --- |",
-            ]
-        )
-        for row in ticker_rows:
-            lines.append(
-                "| "
-                + " | ".join(
-                    [
-                        str(row.get("generated_at") or "-"),
-                        str(row.get("model") or "-"),
-                        str(row.get("data_mode") or "-"),
-                        _summarize_mapping(row.get("action_by_preset")).replace("|", "/"),
-                        _summarize_mapping(row.get("consensus_by_preset")).replace("|", "/"),
-                        _summarize_notes(row.get("comparison_notes")).replace("|", "/"),
-                        str(row.get("research_packet_md_path") or "-").replace("|", "/"),
-                    ]
-                )
-                + " |"
-            )
-        lines.extend(
-            [
-                "",
-                f"- Latest action_by_preset: `{_summarize_mapping(latest_ticker_row.get('action_by_preset'))}`",
-                f"- Latest confidence_by_preset: `{_summarize_mapping(latest_ticker_row.get('confidence_by_preset'))}`",
-                f"- Latest consensus_by_preset: `{_summarize_mapping(latest_ticker_row.get('consensus_by_preset'))}`",
-                f"- Repeated disagreement themes: {'; '.join(_display_theme_counts([row.get('key_disagreement_points') for row in ticker_rows]))}",
-                f"- Recurring bull-case themes: {'; '.join(_display_theme_counts([row.get('bull_case') for row in ticker_rows]))}",
-                f"- Recurring bear-case themes: {'; '.join(_display_theme_counts([row.get('bear_case') for row in ticker_rows]))}",
-                f"- Recurring what to check next manually: {'; '.join(_display_theme_counts([row.get('what_to_check_next_manually') for row in ticker_rows]))}",
-                f"- Latest notable risks / reasons not to act: `{_summarize_notes(latest_ticker_row.get('notable_risks_or_reasons_not_to_act'))}`",
-            ]
-        )
-
-    if not parsed_rows:
-        lines.extend(["", "## No Matching Entries", "", "No journal entries matched the requested scope."])
-
-    markdown_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-    json_payload = {
-        "generated_at": generated_at,
-        "source_journal_path": target_journal_path.as_posix(),
-        "scope": {"ticker": ticker_filter, "all_tickers": ticker_filter is None},
-        "entries_reviewed": len(parsed_rows),
-        "latest_run_dir": str((latest_entry or {}).get("run_dir") or ""),
-        "latest_research_packet_md_path": str((latest_entry or {}).get("research_packet_md_path") or ""),
-        "latest_research_packet_json_path": str((latest_entry or {}).get("research_packet_json_path") or ""),
-        "warnings": warnings,
-        "tickers": [],
-    }
-    for ticker_key in sorted(grouped):
-        ticker_rows = grouped[ticker_key]
-        latest_ticker_row = ticker_rows[-1]
-        json_payload["tickers"].append(
-            {
-                "ticker": ticker_key,
-                "entry_count": len(ticker_rows),
-                "latest_action_by_preset": _as_dict_of_strings(latest_ticker_row.get("action_by_preset")),
-                "latest_confidence_by_preset": _as_dict_of_strings(latest_ticker_row.get("confidence_by_preset")),
-                "latest_consensus_by_preset": _as_dict_of_strings(latest_ticker_row.get("consensus_by_preset")),
-                "repeated_disagreement_themes": _theme_counts([row.get("key_disagreement_points") for row in ticker_rows]),
-                "recurring_bull_case_themes": _theme_counts([row.get("bull_case") for row in ticker_rows]),
-                "recurring_bear_case_themes": _theme_counts([row.get("bear_case") for row in ticker_rows]),
-                "recurring_manual_checks": _theme_counts([row.get("what_to_check_next_manually") for row in ticker_rows]),
-                "latest_notable_risks_or_reasons_not_to_act": _as_list_of_strings(
-                    latest_ticker_row.get("notable_risks_or_reasons_not_to_act")
-                ),
-                "entries": [
-                    {
-                        "generated_at": str(row.get("generated_at") or ""),
-                        "model": str(row.get("model") or ""),
-                        "data_mode": str(row.get("data_mode") or ""),
-                        "action_by_preset": row.get("action_by_preset"),
-                        "confidence_by_preset": row.get("confidence_by_preset"),
-                        "consensus_by_preset": row.get("consensus_by_preset"),
-                        "comparison_notes": row.get("comparison_notes"),
-                        "research_packet_md_path": str(row.get("research_packet_md_path") or ""),
-                        "research_packet_json_path": str(row.get("research_packet_json_path") or ""),
-                    }
-                    for row in ticker_rows
-                ],
-            }
-        )
-    _write_json(json_path, json_payload)
-
-    return ResearchJournalReviewArtifacts(
-        journal_path=target_journal_path,
-        markdown_path=markdown_path,
-        json_path=json_path,
-        ticker=ticker_filter,
-        entries_reviewed=len(parsed_rows),
-        warnings=warnings,
-    )
-
-
-WATCHLIST_SCORING_RULES = [
-    {"rule": "Latest technical-only action is buy", "points": 2},
-    {"rule": "Latest core action is buy", "points": 2},
-    {"rule": "Latest technical-only consensus is bullish", "points": 1},
-    {"rule": "Latest core consensus is bullish", "points": 1},
-    {"rule": "Latest all action is sell or short", "points": -3},
-    {"rule": "Latest no-news action is sell or short", "points": -2},
-    {"rule": "Latest all consensus is bearish", "points": -2},
-    {"rule": "Latest no-news consensus is bearish", "points": -1},
-    {"rule": "Disagreement across preset actions", "points": -1},
-    {"rule": "Comparison notes present", "points": -1},
-    {"rule": "Offline demo / needs validation", "points": -1},
-    {"rule": "Only one journal entry", "points": -2},
-]
-
-
-def _short_text(value: Any, *, limit: int = 80) -> str:
-    text = _summarize_notes(value)
-    if len(text) <= limit:
-        return text
-    return text[: limit - 3].rstrip() + "..."
-
-
-def _is_buy_like(value: str) -> bool:
-    return value.strip().lower() == "buy"
-
-
-def _is_bearish_action(value: str) -> bool:
-    return value.strip().lower() in {"sell", "short"}
-
-
-def _has_disagreement(action_by_preset: dict[str, str], comparison_notes: Any) -> tuple[bool, list[str]]:
-    flags: list[str] = []
-    unique_actions = {value.strip().lower() for value in action_by_preset.values() if value.strip()}
-    if len(unique_actions) > 1:
-        flags.append("preset action conflict")
-    if _as_list_of_strings(comparison_notes):
-        flags.append("comparison notes present")
-    return (len(flags) > 0, flags)
-
-
-def _watchlist_category(score: int, *, disagreement: bool, needs_validation: bool, entry_count: int, bearish_flag: bool) -> str:
-    if entry_count <= 1:
-        return "Insufficient History / Needs More Runs"
-    if bearish_flag and score <= -2:
-        return "Bearish / Avoid For Now Candidates"
-    if disagreement or needs_validation or score <= 1:
-        return "Mixed / Disagreement Candidates"
-    if score >= 2:
-        return "Strong Follow-Up Candidates"
-    return "Mixed / Disagreement Candidates"
-
-
-def build_research_watchlist(
-    *,
-    journal_path: Path | str | None = None,
-    output_path: Path | str | None = None,
-) -> ResearchWatchlistArtifacts:
-    target_journal_path, parsed_rows, warnings = _parsed_research_journal_rows(journal_path=journal_path)
-    markdown_path, json_path = _watchlist_output_paths(output_path)
-    markdown_path.parent.mkdir(parents=True, exist_ok=True)
-
-    grouped: dict[str, list[dict[str, Any]]] = {}
-    for row in parsed_rows:
-        grouped.setdefault(str(row.get("ticker") or "UNKNOWN"), []).append(row)
-
-    generated_at = datetime.now().isoformat(timespec="seconds")
-    scored_tickers: list[dict[str, Any]] = []
-
-    for ticker_key in sorted(grouped):
-        ticker_rows = grouped[ticker_key]
-        latest = ticker_rows[-1]
-        actions = _as_dict_of_strings(latest.get("action_by_preset"))
-        consensus = _as_dict_of_strings(latest.get("consensus_by_preset"))
-        confidence = _as_dict_of_strings(latest.get("confidence_by_preset"))
-        comparison_notes = latest.get("comparison_notes")
-        disagreement, disagreement_flags = _has_disagreement(actions, comparison_notes)
-        needs_validation = str(latest.get("data_mode") or "").strip().lower() == "offline_demo"
-        if str(latest.get("offline_demo_data") or "").strip().lower() == "true":
-            needs_validation = True
-
-        score = 0
-        score_reasons: list[str] = []
-
-        if _is_buy_like(actions.get("technical-only", "")):
-            score += 2
-            score_reasons.append("technical-only action buy (+2)")
-        if _is_buy_like(actions.get("core", "")):
-            score += 2
-            score_reasons.append("core action buy (+2)")
-        if consensus.get("technical-only", "").lower() == "bullish":
-            score += 1
-            score_reasons.append("technical-only consensus bullish (+1)")
-        if consensus.get("core", "").lower() == "bullish":
-            score += 1
-            score_reasons.append("core consensus bullish (+1)")
-        if _is_bearish_action(actions.get("all", "")):
-            score -= 3
-            score_reasons.append("all action bearish (-3)")
-        if _is_bearish_action(actions.get("no-news", "")):
-            score -= 2
-            score_reasons.append("no-news action bearish (-2)")
-        if consensus.get("all", "").lower() == "bearish":
-            score -= 2
-            score_reasons.append("all consensus bearish (-2)")
-        if consensus.get("no-news", "").lower() == "bearish":
-            score -= 1
-            score_reasons.append("no-news consensus bearish (-1)")
-        if disagreement:
-            score -= 1
-            score_reasons.append("disagreement flag (-1)")
-        if needs_validation:
-            score -= 1
-            score_reasons.append("offline demo / needs validation (-1)")
-        if len(ticker_rows) == 1:
-            score -= 2
-            score_reasons.append("single journal entry (-2)")
-
-        bearish_flag = (
-            _is_bearish_action(actions.get("all", ""))
-            or _is_bearish_action(actions.get("no-news", ""))
-            or consensus.get("all", "").lower() == "bearish"
-            or consensus.get("no-news", "").lower() == "bearish"
-        )
-        category = _watchlist_category(
-            score,
-            disagreement=disagreement,
-            needs_validation=needs_validation,
-            entry_count=len(ticker_rows),
-            bearish_flag=bearish_flag,
-        )
-        scored_tickers.append(
-            {
-                "ticker": ticker_key,
-                "latest_generated_at": str(latest.get("generated_at") or ""),
-                "score": score,
-                "category": category,
-                "entry_count": len(ticker_rows),
-                "latest_actions": actions,
-                "latest_consensus": consensus,
-                "latest_confidence": confidence,
-                "disagreement_flags": disagreement_flags + (["needs validation"] if needs_validation else []),
-                "latest_bull_case_summary": _short_text(latest.get("bull_case")),
-                "latest_bear_case_summary": _short_text(latest.get("bear_case")),
-                "latest_packet_path": str(latest.get("research_packet_md_path") or ""),
-                "score_reasons": score_reasons,
-            }
-        )
-
-    categories = [
-        "Strong Follow-Up Candidates",
-        "Mixed / Disagreement Candidates",
-        "Bearish / Avoid For Now Candidates",
-        "Insufficient History / Needs More Runs",
-    ]
-    categorized: dict[str, list[dict[str, Any]]] = {category: [] for category in categories}
-    for item in sorted(scored_tickers, key=lambda entry: (-entry["score"], entry["ticker"])):
-        categorized[item["category"]].append(item)
-
-    lines = [
-        "# Research Watchlist",
-        "",
-        DECISION_SUMMARY_DISCLAIMER,
-        "",
-        f"- Source journal path: `{target_journal_path.as_posix()}`",
-        f"- Generated timestamp: `{generated_at}`",
-        f"- Total journal rows reviewed: `{len(parsed_rows)}`",
-        f"- Tickers reviewed: `{len(grouped)}`",
-        "- Scoring heuristic: Reward recent bullish technical-only/core signals, penalize bearish all/no-news signals, flag disagreement or comparison-note friction, mark offline-demo rows as needs-validation, and reduce confidence when only one journal entry exists.",
-    ]
-    if warnings:
-        lines.extend(["", "## Warnings"])
-        for warning in warnings:
-            lines.append(f"- {warning}")
-
-    for category in categories:
-        lines.extend(
-            [
-                "",
-                f"## {category}",
-                "",
-                "| Ticker | Latest Generated At | Score | Category | Latest Actions | Latest Consensus | Disagreement Flags | Latest Bull Case | Latest Bear Case | Latest Packet Path |",
-                "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
-            ]
-        )
-        items = categorized[category]
-        if not items:
-            lines.append("| - | - | - | - | - | - | - | - | - | - |")
-            continue
-        for item in items:
-            lines.append(
-                "| "
-                + " | ".join(
-                    [
-                        item["ticker"],
-                        item["latest_generated_at"] or "-",
-                        str(item["score"]),
-                        item["category"],
-                        _summarize_mapping(item["latest_actions"]).replace("|", "/"),
-                        _summarize_mapping(item["latest_consensus"]).replace("|", "/"),
-                        (_short_text(item["disagreement_flags"]) if item["disagreement_flags"] else "-").replace("|", "/"),
-                        str(item["latest_bull_case_summary"] or "-").replace("|", "/"),
-                        str(item["latest_bear_case_summary"] or "-").replace("|", "/"),
-                        str(item["latest_packet_path"] or "-").replace("|", "/"),
-                    ]
-                )
-                + " |"
-            )
-
-    markdown_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-    json_payload = {
-        "generated_at": generated_at,
-        "source_journal_path": target_journal_path.as_posix(),
-        "rows_reviewed": len(parsed_rows),
-        "ticker_count": len(grouped),
-        "scoring_rules": WATCHLIST_SCORING_RULES,
-        "per_ticker": scored_tickers,
-        "categories": {category: [item["ticker"] for item in categorized[category]] for category in categories},
-        "warnings": warnings,
-    }
-    _write_json(json_path, json_payload)
-
-    return ResearchWatchlistArtifacts(
-        journal_path=target_journal_path,
-        markdown_path=markdown_path,
-        json_path=json_path,
-        rows_reviewed=len(parsed_rows),
-        ticker_count=len(grouped),
-        warnings=warnings,
-    )
 
 
 def _write_summary(
@@ -1072,16 +359,6 @@ def _write_compare_summary(
             suffix = f" ({classification})" if classification else ""
             lines.append(f"- `{row.get('ticker', '')}` / `{row.get('analyst_preset', '')}`: {detail}{suffix}")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-
-def _stringify_reasoning(value: Any) -> str:
-    if value in (None, ""):
-        return ""
-    if isinstance(value, str):
-        return value.strip()
-    if isinstance(value, (dict, list)):
-        return json.dumps(value, ensure_ascii=True)
-    return str(value)
 
 
 def _signal_counts(result: dict[str, Any], ticker: str) -> tuple[int, int, int]:
@@ -1454,385 +731,6 @@ def _write_preset_comparison_markdown(path: Path, rows: list[dict[str, Any]]) ->
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def _parse_vote_summary(vote_summary: Any) -> dict[str, int]:
-    counts = {"bullish": 0, "bearish": 0, "neutral": 0}
-    for part in str(vote_summary or "").split(","):
-        label, _, value = part.strip().partition("=")
-        normalized_label = label.strip().lower()
-        if normalized_label not in counts:
-            continue
-        try:
-            counts[normalized_label] = int(value.strip())
-        except ValueError:
-            counts[normalized_label] = 0
-    return counts
-
-
-def _split_sentences(text: Any) -> list[str]:
-    normalized = _stringify_reasoning(text).replace("\n", " ").strip()
-    if not normalized:
-        return []
-    chunks = [chunk.strip(" -") for chunk in normalized.split(".") if chunk.strip()]
-    return chunks or [normalized]
-
-
-def _packet_data_mode(rows: list[dict[str, Any]], *, offline_demo_data: bool) -> str:
-    if offline_demo_data:
-        return "offline_demo"
-    data_statuses = {str(row.get("data_status") or "").strip() for row in rows}
-    if OFFLINE_DEMO_DATA_STATUS in data_statuses or "fixture_data" in data_statuses:
-        return "offline_demo"
-    return "live"
-
-
-def _best_reasoning_excerpt(rows: list[dict[str, Any]], *, preferred_consensus: str | None = None) -> str:
-    candidate_rows = rows
-    if preferred_consensus:
-        filtered = [row for row in rows if str(row.get("analyst_consensus") or "").strip().lower() == preferred_consensus]
-        if filtered:
-            candidate_rows = filtered
-    candidate_rows = sorted(
-        candidate_rows,
-        key=lambda row: (
-            0 if str(row.get("run_status") or "").strip().lower() == "success" else 1,
-            -int(str(row.get("confidence") or "0") or "0"),
-        ),
-    )
-    for row in candidate_rows:
-        for sentence in _split_sentences(row.get("reasoning")):
-            return sentence
-    return ""
-
-
-def _manual_checks_for_ticker(packet_rows: list[dict[str, Any]], *, data_mode: str) -> list[str]:
-    checks = [
-        "Validate the latest price action, volume, and trend context with current charts.",
-        "Recheck company-specific news, filings, and catalysts that may have changed since the run.",
-        "Confirm whether the portfolio-manager action still matches the latest analyst signals after refreshing data.",
-    ]
-    if data_mode == "offline_demo":
-        checks.insert(0, "Refresh the run with live data before treating any research angle as current.")
-    if any(str(row.get("comparison_note") or "").strip() for row in packet_rows):
-        checks.append("Inspect the preset rows with conflict notes to see whether the disagreement comes from votes, rationale, or both.")
-    return checks
-
-
-def _data_limitations_for_ticker(packet_rows: list[dict[str, Any]], *, data_mode: str, preset_count: int) -> list[str]:
-    limitations = [
-        "This packet summarizes agent output and is intended for educational research review, not trading instructions.",
-        "Portfolio-manager actions are final outputs and may differ from simple analyst vote counts.",
-    ]
-    if data_mode == "offline_demo":
-        limitations.append("This packet is based on static fixture data and should not be treated as current market analysis.")
-    else:
-        limitations.append("Live-data runs can still age quickly and require current-data validation before any real-world use.")
-    if preset_count <= 1:
-        limitations.append("Only one analyst preset was analyzed, so cross-preset disagreement is limited.")
-    if any(str(row.get("run_status") or "").strip().lower() != "success" for row in packet_rows):
-        limitations.append("At least one preset did not complete successfully, so the comparison is incomplete.")
-    return limitations
-
-
-def _notable_risks_for_ticker(packet_rows: list[dict[str, Any]], *, data_mode: str) -> list[str]:
-    risks: list[str] = []
-    if data_mode == "offline_demo":
-        risks.append("Static fixture inputs can diverge materially from the current market regime.")
-    if any(str(row.get("analyst_consensus") or "").strip().lower() == "mixed" for row in packet_rows):
-        risks.append("Agent disagreement remains unresolved, which weakens confidence in any single research angle.")
-    if any(str(row.get("comparison_note") or "").strip() for row in packet_rows):
-        risks.append("One or more presets show action-versus-consensus conflict, so the final action may not reflect broad analyst alignment.")
-    if any(str(row.get("run_status") or "").strip().lower() != "success" for row in packet_rows):
-        risks.append("Failed preset runs reduce coverage and can hide contradictory signals.")
-    if not risks:
-        risks.append("Even aligned presets can miss catalyst, liquidity, or macro risks that require manual review.")
-    return risks
-
-
-def _build_ticker_packet(
-    ticker: str,
-    packet_rows: list[dict[str, Any]],
-    *,
-    model: str,
-    data_mode: str,
-    preset_order: list[str] | None = None,
-    preset_run_dirs: dict[str, str] | None = None,
-) -> dict[str, Any]:
-    preset_positions = {preset: index for index, preset in enumerate(preset_order or [])}
-    ordered_rows = sorted(
-        packet_rows,
-        key=lambda row: (
-            preset_positions.get(str(row.get("analyst_preset") or "").strip(), len(preset_positions)),
-            str(row.get("analyst_preset") or ""),
-        ),
-    )
-    presets = [str(row.get("analyst_preset") or "").strip() for row in ordered_rows]
-    preset_summaries: list[dict[str, Any]] = []
-    disagreement_points: list[str] = []
-    confidence_by_preset: dict[str, str] = {}
-    action_by_preset: dict[str, str] = {}
-    consensus_by_preset: dict[str, str] = {}
-    comparison_notes: list[str] = []
-
-    for row in ordered_rows:
-        preset = str(row.get("analyst_preset") or "").strip()
-        action = str(row.get("action") or "").strip() or "FAILED"
-        confidence = str(row.get("confidence") or "").strip() or "-"
-        vote_summary = str(row.get("analyst_vote_summary") or "").strip() or "bullish=0, bearish=0, neutral=0"
-        consensus = str(row.get("analyst_consensus") or "").strip() or "none"
-        comparison_note = str(row.get("comparison_note") or "").strip()
-        reasoning = _stringify_reasoning(row.get("reasoning"))
-        run_status = str(row.get("run_status") or "").strip() or "unknown"
-
-        action_by_preset[preset] = action
-        confidence_by_preset[preset] = confidence
-        consensus_by_preset[preset] = consensus
-        if comparison_note:
-            comparison_notes.append(f"{preset}: {comparison_note}")
-            disagreement_points.append(f"{preset}: {comparison_note}")
-
-        counts = _parse_vote_summary(vote_summary)
-        if consensus == "mixed":
-            disagreement_points.append(
-                f"{preset}: analyst votes are mixed ({vote_summary}), which is a signal to investigate rather than a directional takeaway."
-            )
-        elif action.lower() in {"buy", "sell", "short"} and consensus not in {"none", ""}:
-            expected = "bullish" if action.lower() == "buy" else "bearish"
-            if consensus != expected:
-                disagreement_points.append(
-                    f"{preset}: final action is `{action}` while analyst consensus is `{consensus}`, indicating agent disagreement."
-                )
-
-        preset_summaries.append(
-            {
-                "preset": preset,
-                "action": action,
-                "confidence": confidence,
-                "analyst_vote_summary": vote_summary,
-                "analyst_consensus": consensus,
-                "comparison_note": comparison_note,
-                "reasoning": reasoning,
-                "run_status": run_status,
-                "data_status": str(row.get("data_status") or "").strip(),
-                "run_dir": (preset_run_dirs or {}).get(preset) or str(row.get("run_dir") or "").strip(),
-                "log_path": str(row.get("log_path") or "").strip(),
-                "vote_counts": counts,
-            }
-        )
-
-    technical_row = next((row for row in ordered_rows if str(row.get("analyst_preset") or "").strip() == "technical-only"), None)
-    broader_rows = [row for row in ordered_rows if str(row.get("analyst_preset") or "").strip() != "technical-only"]
-
-    bull_case_parts: list[str] = []
-    if technical_row and str(technical_row.get("action") or "").strip().lower() == "buy":
-        bull_case_parts.append("Technical-only output is bullish, which can be treated as a momentum research angle to investigate.")
-    bullish_excerpt = _best_reasoning_excerpt(ordered_rows, preferred_consensus="bullish")
-    if bullish_excerpt:
-        bull_case_parts.append(f"Representative bullish signal: {bullish_excerpt}.")
-    elif any(str(row.get("action") or "").strip().lower() == "buy" for row in ordered_rows):
-        bull_case_parts.append("At least one preset still produced a bullish directional action, but it requires current-data validation.")
-    else:
-        bull_case_parts.append("No preset produced a clean bullish alignment, so upside arguments remain tentative.")
-
-    bear_case_parts: list[str] = []
-    if broader_rows and any(str(row.get("analyst_consensus") or "").strip().lower() in {"bearish", "mixed"} for row in broader_rows):
-        bear_case_parts.append("Broader presets are mixed or bearish, suggesting the bullish technical read may not survive wider review.")
-    bearish_excerpt = _best_reasoning_excerpt(ordered_rows, preferred_consensus="bearish")
-    if bearish_excerpt:
-        bear_case_parts.append(f"Representative bearish signal: {bearish_excerpt}.")
-    elif any(str(row.get("action") or "").strip().lower() in {"sell", "short"} for row in ordered_rows):
-        bear_case_parts.append("One or more presets still lean bearish on the final action, which is a cautionary signal to investigate.")
-    else:
-        bear_case_parts.append("No preset produced a decisive bearish consensus, but downside risks still require manual review.")
-
-    if technical_row and broader_rows:
-        broader_consensus = {str(row.get("analyst_consensus") or "").strip().lower() for row in broader_rows}
-        if str(technical_row.get("analyst_consensus") or "").strip().lower() == "bullish" and broader_consensus & {"mixed", "bearish"}:
-            disagreement_points.append(
-                "Technical-only is bullish while broader presets are mixed or bearish, so the main research angle requires wider current-data validation."
-            )
-
-    if not disagreement_points:
-        disagreement_points.append("No major preset conflict was flagged, but the packet still requires current-data validation.")
-
-    data_limitations = _data_limitations_for_ticker(ordered_rows, data_mode=data_mode, preset_count=len(ordered_rows))
-    manual_checks = _manual_checks_for_ticker(ordered_rows, data_mode=data_mode)
-    notable_risks = _notable_risks_for_ticker(ordered_rows, data_mode=data_mode)
-
-    return {
-        "ticker": ticker,
-        "model": model,
-        "data_mode": data_mode,
-        "presets_analyzed": presets,
-        "preset_summaries": preset_summaries,
-        "action_by_preset": action_by_preset,
-        "confidence_by_preset": confidence_by_preset,
-        "consensus_by_preset": consensus_by_preset,
-        "comparison_notes": comparison_notes,
-        "bull_case": " ".join(bull_case_parts).strip(),
-        "bear_case": " ".join(bear_case_parts).strip(),
-        "key_disagreement_points": disagreement_points,
-        "data_limitations": data_limitations,
-        "what_to_check_next_manually": manual_checks,
-        "notable_risks_or_reasons_not_to_act": notable_risks,
-    }
-
-
-def _render_research_packet_markdown(payload: dict[str, Any]) -> str:
-    lines = [
-        "# Research Packet",
-        "",
-        DECISION_SUMMARY_DISCLAIMER,
-        "",
-        "This packet is designed for educational research review. It highlights research angles, agent disagreement, and items that require current-data validation.",
-        "",
-    ]
-    if payload.get("offline_demo_data"):
-        lines.extend(
-            [
-                f"Offline/demo data note: {OFFLINE_DEMO_DISCLAIMER}",
-                "This packet is based on static fixture data and should not be treated as current market analysis.",
-                "",
-            ]
-        )
-
-    lines.extend(
-        [
-            "## Run Context",
-            "",
-            f"- Model: `{payload.get('model', '')}`",
-            f"- Data mode: `{payload.get('data_mode', '')}`",
-            f"- Presets analyzed: `{', '.join(payload.get('presets_analyzed', []))}`",
-            f"- Run directory: `{payload.get('run_dir', '')}`",
-            "",
-        ]
-    )
-
-    for ticker_packet in payload.get("tickers", []):
-        lines.extend(
-            [
-                f"## {ticker_packet['ticker']}",
-                "",
-                f"- Ticker: `{ticker_packet['ticker']}`",
-                f"- Model: `{ticker_packet['model']}`",
-                f"- Data mode: `{ticker_packet['data_mode']}`",
-                f"- Presets analyzed: `{', '.join(ticker_packet['presets_analyzed'])}`",
-                "",
-                "| Preset | Final Action | Confidence | Analyst Votes | Analyst Consensus | Comparison Notes | Run Status |",
-                "| --- | --- | --- | --- | --- | --- | --- |",
-            ]
-        )
-        for preset_summary in ticker_packet["preset_summaries"]:
-            analyst_votes = preset_summary["analyst_vote_summary"].replace("|", "\\|")
-            comparison_note = (preset_summary["comparison_note"] or "-").replace("|", "\\|")
-            lines.append(
-                f"| {preset_summary['preset']} | {preset_summary['action']} | {preset_summary['confidence']} | "
-                f"{analyst_votes} | {preset_summary['analyst_consensus']} | {comparison_note} | {preset_summary['run_status']} |"
-            )
-
-        lines.extend(
-            [
-                "",
-                "### Final Action By Preset",
-                "",
-            ]
-        )
-        for preset in ticker_packet["presets_analyzed"]:
-            lines.append(
-                f"- `{preset}`: action=`{ticker_packet['action_by_preset'].get(preset, '-')}`, "
-                f"confidence=`{ticker_packet['confidence_by_preset'].get(preset, '-')}`, "
-                f"analyst_consensus=`{ticker_packet['consensus_by_preset'].get(preset, '-')}`"
-            )
-
-        lines.extend(
-            [
-                "",
-                "### Bull Case",
-                "",
-                ticker_packet["bull_case"],
-                "",
-                "### Bear Case",
-                "",
-                ticker_packet["bear_case"],
-                "",
-                "### Key Disagreement Points",
-                "",
-            ]
-        )
-        for item in ticker_packet["key_disagreement_points"]:
-            lines.append(f"- {item}")
-
-        lines.extend(["", "### Data Limitations", ""])
-        for item in ticker_packet["data_limitations"]:
-            lines.append(f"- {item}")
-
-        lines.extend(["", "### What To Check Next Manually", ""])
-        for item in ticker_packet["what_to_check_next_manually"]:
-            lines.append(f"- {item}")
-
-        lines.extend(["", "### Notable Risks / Reasons Not To Act", ""])
-        for item in ticker_packet["notable_risks_or_reasons_not_to_act"]:
-            lines.append(f"- {item}")
-
-        lines.append("")
-
-    return "\n".join(lines) + "\n"
-
-
-def write_research_packet(
-    run_dir: Path,
-    *,
-    config: BasketRunConfig,
-    comparison_rows: list[dict[str, Any]] | None = None,
-    decision_rows: list[dict[str, Any]] | None = None,
-    preset_run_dirs: dict[str, str] | None = None,
-) -> ResearchPacketArtifacts:
-    source_rows = comparison_rows if comparison_rows is not None else decision_rows
-    packet_rows: list[dict[str, Any]]
-    if source_rows is not None:
-        packet_rows = [dict(row) for row in source_rows]
-    elif (run_dir / "preset_comparison.csv").exists():
-        packet_rows = _csv_row_list(run_dir / "preset_comparison.csv")
-    else:
-        decision_csv_rows = _csv_row_list(run_dir / "combined_decisions.csv")
-        packet_rows = [_comparison_row_from_decision_row(row, run_dir=run_dir) for row in decision_csv_rows]
-
-    ordered_presets: list[str] = []
-    seen_presets: set[str] = set()
-    for row in packet_rows:
-        preset = str(row.get("analyst_preset") or "").strip()
-        if preset and preset not in seen_presets:
-            ordered_presets.append(preset)
-            seen_presets.add(preset)
-
-    data_mode = _packet_data_mode(packet_rows, offline_demo_data=config.offline_demo_data)
-    tickers = sorted({str(row.get("ticker") or "").strip() for row in packet_rows if str(row.get("ticker") or "").strip()})
-    ticker_packets = [
-        _build_ticker_packet(
-            ticker,
-            [row for row in packet_rows if str(row.get("ticker") or "").strip() == ticker],
-            model=config.model,
-            data_mode=data_mode,
-            preset_order=ordered_presets,
-            preset_run_dirs=preset_run_dirs,
-        )
-        for ticker in tickers
-    ]
-    payload = {
-        "generated_at": datetime.now().isoformat(),
-        "run_dir": run_dir.as_posix(),
-        "model": config.model,
-        "data_mode": data_mode,
-        "offline_demo_data": config.offline_demo_data,
-        "presets_analyzed": ordered_presets,
-        "tickers": ticker_packets,
-    }
-    markdown_path = run_dir / "research_packet.md"
-    json_path = run_dir / "research_packet.json"
-    markdown_path.write_text(_render_research_packet_markdown(payload), encoding="utf-8")
-    _write_json(json_path, payload)
-    return ResearchPacketArtifacts(markdown_path=markdown_path, json_path=json_path, payload=payload)
-
-
 def run_preset_comparison(config: BasketRunConfig, presets: list[str]) -> PresetComparisonArtifacts:
     comparison_run_dir = _build_run_dir(config.output_dir)
     preset_base_dir = comparison_run_dir / "preset_runs"
@@ -2178,11 +1076,133 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=str,
         help="Custom markdown output path for research watchlist mode. A JSON companion is written beside it.",
     )
+    parser.add_argument(
+        "--watchlist-path",
+        type=str,
+        help="Optional JSON path for research watchlist input used by validation-checklist mode.",
+    )
+    parser.add_argument(
+        "--validation-checklist",
+        action="store_true",
+        help="Read the research journal and optional watchlist JSON to create a manual validation checklist for one ticker.",
+    )
+    parser.add_argument(
+        "--validation-output",
+        type=str,
+        help="Custom markdown output path for validation-checklist mode. A JSON companion is written beside it.",
+    )
+    parser.add_argument(
+        "--validation-checklist-path",
+        type=str,
+        help="Optional JSON path for validation checklist input used by record-human-review mode.",
+    )
+    parser.add_argument(
+        "--record-human-review",
+        action="store_true",
+        help="Append a human validation outcome row to the local human review log without running analysts or data workflows.",
+    )
+    parser.add_argument(
+        "--human-status",
+        type=str,
+        help="Human review outcome. Allowed values: Watchlist, Reject, Deep Research, Paper Trade Candidate, Trade Candidate.",
+    )
+    parser.add_argument(
+        "--review-notes",
+        type=str,
+        help="Optional free-form notes for record-human-review mode.",
+    )
+    parser.add_argument(
+        "--human-review-log-path",
+        type=str,
+        help="Custom CSV path for the append-only human review log.",
+    )
+    parser.add_argument(
+        "--review-human-reviews",
+        action="store_true",
+        help="Read the human review log CSV and write a markdown/json summary report without running analysts or data workflows.",
+    )
+    parser.add_argument(
+        "--human-review-summary-output",
+        type=str,
+        help="Custom markdown output path for review-human-reviews mode. A JSON companion is written beside it.",
+    )
     return parser
 
 
 def main() -> int:
     args = build_arg_parser().parse_args()
+    if args.review_human_reviews:
+        summary_ticker = str(args.ticker or "").strip().upper() or None
+        artifacts = review_human_reviews(
+            log_path=args.human_review_log_path,
+            ticker=summary_ticker,
+            output_path=args.human_review_summary_output,
+        )
+        print(
+            json.dumps(
+                {
+                    "review_human_reviews": True,
+                    "source_human_review_log_path": artifacts.log_path.as_posix(),
+                    "human_review_summary_markdown": artifacts.markdown_path.as_posix(),
+                    "human_review_summary_json": artifacts.json_path.as_posix(),
+                    "ticker": artifacts.ticker,
+                    "rows_reviewed": artifacts.rows_reviewed,
+                    "reviewed_ticker_count": artifacts.reviewed_ticker_count,
+                    "warnings": artifacts.warnings,
+                },
+                indent=2,
+            )
+        )
+        return 0
+
+    if args.record_human_review:
+        artifacts = record_human_review(
+            ticker=args.ticker,
+            human_status=args.human_status,
+            review_notes=args.review_notes,
+            validation_checklist_path=args.validation_checklist_path,
+            journal_path=args.research_journal_path,
+            watchlist_path=args.watchlist_path,
+            human_review_log_path=args.human_review_log_path,
+        )
+        print(
+            json.dumps(
+                {
+                    "human_review_log_path": artifacts.log_path.as_posix(),
+                    "rows_written": artifacts.rows_written,
+                    "ticker": artifacts.ticker,
+                    "human_status": artifacts.human_status,
+                    "warnings": artifacts.warnings,
+                },
+                indent=2,
+            )
+        )
+        return 0
+
+    if args.validation_checklist:
+        checklist_ticker = str(args.ticker or "").strip().upper() or None
+        artifacts = build_validation_checklist(
+            ticker=checklist_ticker,
+            journal_path=args.research_journal_path,
+            watchlist_path=args.watchlist_path,
+            output_path=args.validation_output,
+        )
+        print(
+            json.dumps(
+                {
+                    "validation_checklist": True,
+                    "ticker": artifacts.ticker,
+                    "source_journal_path": artifacts.journal_path.as_posix(),
+                    "source_watchlist_path": artifacts.watchlist_path.as_posix() if artifacts.watchlist_path else None,
+                    "validation_markdown": artifacts.markdown_path.as_posix(),
+                    "validation_json": artifacts.json_path.as_posix(),
+                    "warnings": artifacts.warnings,
+                },
+                indent=2,
+            )
+        )
+        return 0
+
     if args.research_watchlist:
         artifacts = build_research_watchlist(
             journal_path=args.research_journal_path,
@@ -2349,3 +1369,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
