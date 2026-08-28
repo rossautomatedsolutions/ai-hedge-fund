@@ -39,6 +39,11 @@ from src.research_workflows import (
     write_research_packet,
 )
 from src.research_workflows.common import _default_research_journal_path
+from src.signal_artifacts import (
+    DEFAULT_SIGNAL_ARTIFACT_VERSION,
+    SIGNAL_CAPTURE_FILENAME,
+    export_signal_ledger_bundle,
+)
 from src.utils.analysts import ANALYST_ORDER
 from src.utils.display import print_trading_output
 from src.utils.ollama import ensure_ollama_and_model
@@ -250,6 +255,52 @@ def resolve_data_request_options(
         "request_timeout_seconds": request_timeout_seconds,
         "max_data_retries": max_data_retries,
         "skip_optional_slow_data": False,
+    }
+
+
+def _ticker_result_record(
+    *,
+    ticker: str,
+    run_status: str,
+    data_check: dict[str, Any] | None,
+    failure: dict[str, Any] | None = None,
+    result: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        "ticker": ticker,
+        "run_status": run_status,
+        "data_check": data_check,
+        "failure": failure,
+        "result": result,
+    }
+
+
+def _write_ticker_result_records(path: Path, *, run_dir: Path, config: BasketRunConfig, records: list[dict[str, Any]]) -> None:
+    _write_json(
+        path,
+        {
+            "run_id": run_dir.name,
+            "basket_name": config.basket_name,
+            "analyst_preset": config.analyst_preset,
+            "tickers": list(config.tickers),
+            "analysts": list(config.analysts),
+            "records": records,
+        },
+    )
+
+
+def _signal_ledger_payload(artifacts) -> dict[str, Any]:
+    return {
+        "signal_ledger_csv": artifacts.csv_path.as_posix(),
+        "signal_ledger_json": artifacts.json_path.as_posix(),
+        "signal_ledger_manifest_json": artifacts.manifest_path.as_posix(),
+        "trading_foundation_trades_csv": artifacts.trading_foundation_trades_path.as_posix(),
+        "trading_foundation_handoff_manifest_json": artifacts.trading_foundation_manifest_path.as_posix(),
+        "signal_ledger_run_id": artifacts.run_id,
+        "signal_ledger_workflow_status": artifacts.workflow_status,
+        "signal_ledger_record_count": artifacts.record_count,
+        "signal_ledger_eligible_record_count": artifacts.eligible_record_count,
+        "trading_foundation_prepared_trade_row_count": artifacts.prepared_trade_row_count,
     }
 
 
@@ -852,10 +903,12 @@ def run_basket(config: BasketRunConfig) -> Path:
     failures: list[dict[str, Any]] = []
     decision_rows: list[dict[str, Any]] = []
     data_checks: list[dict[str, Any]] = []
+    ticker_result_records: list[dict[str, Any]] = []
 
     if config.dry_run:
         _write_json(run_dir / "failures.json", failures)
         _write_json(run_dir / "data_check.json", data_checks)
+        _write_ticker_result_records(run_dir / SIGNAL_CAPTURE_FILENAME, run_dir=run_dir, config=config, records=ticker_result_records)
         (run_dir / "raw_console_output.txt").write_text("", encoding="utf-8")
         _write_decision_summary(run_dir / "decision_summary.md", decision_rows)
         _write_summary(run_dir / "run_summary.md", config, successes, failures, run_dir, data_checks)
@@ -894,6 +947,13 @@ def run_basket(config: BasketRunConfig) -> Path:
                         (logs_dir / f"{ticker}.log").write_text(format_ticker_data_check(data_check_result) + "\n", encoding="utf-8")
                         if data_check_result.ok:
                             successes.append({"ticker": ticker, "mode": "data-check-only"})
+                            ticker_result_records.append(
+                                _ticker_result_record(
+                                    ticker=ticker,
+                                    run_status="data_check_only",
+                                    data_check=data_check_payload,
+                                )
+                            )
                         else:
                             failure_payload = {
                                 "ticker": ticker,
@@ -902,6 +962,14 @@ def run_basket(config: BasketRunConfig) -> Path:
                                 "error": data_check_result.diagnosis,
                             }
                             failures.append(failure_payload)
+                            ticker_result_records.append(
+                                _ticker_result_record(
+                                    ticker=ticker,
+                                    run_status="failed",
+                                    data_check=data_check_payload,
+                                    failure=failure_payload,
+                                )
+                            )
                             decision_rows.append(
                                 _failure_row(
                                     ticker,
@@ -929,6 +997,14 @@ def run_basket(config: BasketRunConfig) -> Path:
                             "error": message,
                         }
                         failures.append(failure_payload)
+                        ticker_result_records.append(
+                            _ticker_result_record(
+                                ticker=ticker,
+                                run_status="failed",
+                                data_check=data_check_payload,
+                                failure=failure_payload,
+                            )
+                        )
                         decision_rows.append(
                             _failure_row(
                                 ticker,
@@ -966,6 +1042,14 @@ def run_basket(config: BasketRunConfig) -> Path:
                         (logs_dir / f"{ticker}.log").write_text(full_log_output, encoding="utf-8")
                         print(f"[ticker:{ticker}] completed successfully | log={logs_dir / f'{ticker}.log'}")
                         successes.append({"ticker": ticker})
+                        ticker_result_records.append(
+                            _ticker_result_record(
+                                ticker=ticker,
+                                run_status="success",
+                                data_check=data_check_payload,
+                                result=result,
+                            )
+                        )
                         decision_rows.append(_flatten_decision(ticker, result, config=config, data_check=data_check_payload))
                     except Exception as exc:
                         log_output = buffer.getvalue()
@@ -981,6 +1065,14 @@ def run_basket(config: BasketRunConfig) -> Path:
                             "error": str(exc),
                         }
                         failures.append(failure_payload)
+                        ticker_result_records.append(
+                            _ticker_result_record(
+                                ticker=ticker,
+                                run_status="failed",
+                                data_check=data_check_payload,
+                                failure=failure_payload,
+                            )
+                        )
                         decision_rows.append(
                             _failure_row(
                                 ticker,
@@ -1005,6 +1097,7 @@ def run_basket(config: BasketRunConfig) -> Path:
         (run_dir / "raw_console_output.txt").write_text("\n".join(combined_logs), encoding="utf-8")
         _write_json(run_dir / "failures.json", failures)
         _write_json(run_dir / "data_check.json", data_checks)
+        _write_ticker_result_records(run_dir / SIGNAL_CAPTURE_FILENAME, run_dir=run_dir, config=config, records=ticker_result_records)
         _write_decisions_csv(run_dir / "combined_decisions.csv", decision_rows)
         _write_decision_summary(run_dir / "decision_summary.md", decision_rows)
         _write_summary(run_dir / "run_summary.md", config, successes, failures, run_dir, data_checks)
@@ -1050,6 +1143,27 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--research-packet",
         action="store_true",
         help="Write a research_packet.md and research_packet.json summary into the run output directory.",
+    )
+    parser.add_argument(
+        "--export-signal-ledger",
+        action="store_true",
+        help="Write a canonical signal ledger and Trading Foundation handoff bundle for the run or for an existing run directory.",
+    )
+    parser.add_argument(
+        "--signal-ledger-output",
+        type=str,
+        help="Custom directory for signal ledger and Trading Foundation handoff artifacts. Defaults to the source run directory.",
+    )
+    parser.add_argument(
+        "--signal-artifact-version",
+        type=str,
+        default=DEFAULT_SIGNAL_ARTIFACT_VERSION,
+        help="Version label to stamp into exported signal-ledger records and manifests.",
+    )
+    parser.add_argument(
+        "--signal-ledger-source-run-dir",
+        type=str,
+        help="Existing basket run directory to export without rerunning analysts. Requires --export-signal-ledger.",
     )
     parser.add_argument(
         "--append-research-journal",
@@ -1490,6 +1604,23 @@ def main() -> int:
         )
         return 0
 
+    if args.signal_ledger_source_run_dir:
+        if not args.export_signal_ledger:
+            raise SystemExit("--signal-ledger-source-run-dir requires --export-signal-ledger.")
+        if args.tickers:
+            raise SystemExit("--signal-ledger-source-run-dir is export-only and cannot be combined with --tickers.")
+        if args.compare_presets:
+            raise SystemExit("--signal-ledger-source-run-dir cannot be combined with --compare-presets.")
+        if args.full_research_workflow:
+            raise SystemExit("--signal-ledger-source-run-dir cannot be combined with --full-research-workflow.")
+        export_artifacts = export_signal_ledger_bundle(
+            run_dir=args.signal_ledger_source_run_dir,
+            output_dir=args.signal_ledger_output,
+            artifact_version=args.signal_artifact_version,
+        )
+        print(json.dumps(_signal_ledger_payload(export_artifacts), indent=2))
+        return 0
+
     tickers = _select_tickers(args.tickers, args.basket_name, args.max_symbols)
     compare_presets = parse_compare_presets(args.compare_presets)
     analysts = resolve_analysts_for_preset(args.analyst_preset)
@@ -1518,6 +1649,8 @@ def main() -> int:
     )
 
     if args.full_research_workflow:
+        if args.export_signal_ledger:
+            raise SystemExit("--export-signal-ledger is currently limited to single basket runs or --signal-ledger-source-run-dir.")
         workflow_presets = compare_presets or ["technical-only", "core", "no-news", "all"]
         print(
             json.dumps(
@@ -1532,6 +1665,8 @@ def main() -> int:
         return 0
 
     if compare_presets:
+        if args.export_signal_ledger:
+            raise SystemExit("--export-signal-ledger is currently limited to single basket runs or --signal-ledger-source-run-dir.")
         artifacts = run_preset_comparison(config, compare_presets)
         research_packet_path = None
         research_packet_json = None
@@ -1577,10 +1712,23 @@ def main() -> int:
         )
         return 0
 
+    if args.export_signal_ledger and config.dry_run:
+        raise SystemExit("--export-signal-ledger is incompatible with --dry-run because no signal decisions are produced.")
+    if args.export_signal_ledger and config.data_check_only:
+        raise SystemExit("--export-signal-ledger is incompatible with --data-check-only because no signal decisions are produced.")
+
     run_dir = run_basket(config)
     research_packet_path = None
     research_packet_json = None
     research_journal_path = None
+    signal_ledger_payload: dict[str, Any] = {}
+    if args.export_signal_ledger:
+        export_artifacts = export_signal_ledger_bundle(
+            run_dir=run_dir,
+            output_dir=args.signal_ledger_output,
+            artifact_version=args.signal_artifact_version,
+        )
+        signal_ledger_payload = _signal_ledger_payload(export_artifacts)
     if args.research_packet:
         research_artifacts = write_research_packet(run_dir, config=config)
         research_packet_path = research_artifacts.markdown_path.as_posix()
@@ -1617,6 +1765,7 @@ def main() -> int:
                 "dry_run": config.dry_run,
                 "data_check_only": config.data_check_only,
                 "offline_demo_data": config.offline_demo_data,
+                **signal_ledger_payload,
             },
             indent=2,
         )

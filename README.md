@@ -168,6 +168,30 @@ poetry run python -B -m src.basket_runner --validation-checklist --ticker BB --r
 poetry run python -B -m src.basket_runner --review-human-reviews --human-review-log-path outputs\human_review_log.csv
 ```
 
+Signal-ledger handoff commands:
+
+```bash
+poetry run python -B -m src.basket_runner --tickers BB --analyst-preset core --export-signal-ledger --output-dir outputs\signal_handoff_demo
+poetry run python -B -m src.basket_runner --export-signal-ledger --signal-ledger-source-run-dir outputs\ras_ollama_basket_runs\20260828_010203 --signal-ledger-output outputs\reexported_signal_bundle
+```
+
+`--export-signal-ledger` writes an AIHF-owned machine-readable bundle for Trading Foundation handoff:
+
+- `signal_ledger.csv`
+- `signal_ledger.json`
+- `signal_ledger_manifest.json`
+- `trading_foundation_trades.csv`
+- `trading_foundation_handoff_manifest.json`
+
+Important ledger behavior:
+
+- missing analysts are exported as explicit `abstain` rows rather than silently becoming `neutral`
+- offline demo rows stay exportable for contract testing but are marked `is_backtest_eligible=false`
+- current live research and historical-window live research also fail closed until point-in-time safety is proven from captured metadata and source behavior
+- AIHF does not auto-run Trading Foundation from this path because the current TF engine still writes outputs/cache artifacts inside the Trading Foundation repository tree
+
+See `docs/signal_ledger_trading_foundation_handoff.md` for the audit conclusion and selected integration path.
+
 Output behavior:
 
 - If you pass `--output-dir`, the timestamped basket comparison run is written under `<output-dir>\<timestamp>\...`.
