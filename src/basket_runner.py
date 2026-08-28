@@ -1023,6 +1023,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--show-reasoning", action="store_true")
     parser.add_argument("--analyst-preset", type=str, default="all", choices=sorted(ANALYST_PRESETS.keys()))
     parser.add_argument(
+        "--full-research-workflow",
+        action="store_true",
+        help="Run preset comparison, research packet generation, journal append, watchlist refresh, and per-ticker validation checklists in one research-only workflow.",
+    )
+    parser.add_argument(
         "--compare-presets",
         type=str,
         help="Comma-separated analyst presets to run for side-by-side comparison reports.",
@@ -1127,6 +1132,244 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Custom markdown output path for review-human-reviews mode. A JSON companion is written beside it.",
     )
     return parser
+
+
+def _full_workflow_watchlist_output_path(args: argparse.Namespace) -> str | None:
+    if args.watchlist_output:
+        if args.watchlist_path and Path(args.watchlist_output).with_suffix(".json") != Path(args.watchlist_path):
+            raise SystemExit(
+                "--watchlist-output and --watchlist-path must refer to the same companion JSON path in --full-research-workflow mode."
+            )
+        return args.watchlist_output
+    if args.watchlist_path:
+        return str(Path(args.watchlist_path).with_suffix(".md"))
+    return None
+
+
+def _full_workflow_output_root(config: BasketRunConfig) -> Path | None:
+    if not config.output_dir:
+        return None
+    return Path(config.output_dir)
+
+
+def _full_workflow_research_journal_path(
+    args: argparse.Namespace,
+    config: BasketRunConfig,
+) -> str | None:
+    if args.research_journal_path:
+        return args.research_journal_path
+    output_root = _full_workflow_output_root(config)
+    if output_root is None:
+        return None
+    return str(output_root / "research_journal.csv")
+
+
+def _full_workflow_watchlist_markdown_path(
+    args: argparse.Namespace,
+    config: BasketRunConfig,
+) -> str | None:
+    explicit_path = _full_workflow_watchlist_output_path(args)
+    if explicit_path:
+        return explicit_path
+    output_root = _full_workflow_output_root(config)
+    if output_root is None:
+        return None
+    return str(output_root / "research_watchlist.md")
+
+
+def _full_workflow_validation_output_path(
+    args: argparse.Namespace,
+    config: BasketRunConfig,
+    *,
+    ticker: str,
+) -> str | None:
+    if args.validation_output:
+        return args.validation_output
+    output_root = _full_workflow_output_root(config)
+    if output_root is None:
+        return None
+    return str(output_root / f"validation_checklist_{ticker.upper()}.md")
+
+
+def _dedupe_warnings(warnings: list[str]) -> list[str]:
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for warning in warnings:
+        normalized = str(warning).strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append(normalized)
+    return deduped
+
+
+def _full_workflow_ticker_results(
+    *,
+    tickers: list[str],
+    comparison_rows: list[dict[str, Any]],
+    presets_requested: list[str],
+) -> dict[str, dict[str, Any]]:
+    ticker_results: dict[str, dict[str, Any]] = {}
+    for ticker in tickers:
+        rows = [row for row in comparison_rows if str(row.get("ticker") or "").strip().upper() == ticker.upper()]
+        successful_rows = [row for row in rows if str(row.get("run_status") or "").strip().lower() == "success"]
+        failed_rows = [row for row in rows if str(row.get("run_status") or "").strip().lower() != "success"]
+        seen_presets: list[str] = []
+        seen_presets_set: set[str] = set()
+        for row in rows:
+            preset = str(row.get("analyst_preset") or "").strip()
+            if preset and preset not in seen_presets_set:
+                seen_presets.append(preset)
+                seen_presets_set.add(preset)
+
+        if not rows:
+            status = "missing"
+        elif failed_rows and successful_rows:
+            status = "partial_failure"
+        elif failed_rows:
+            status = "failed"
+        else:
+            status = "success"
+
+        ticker_results[ticker] = {
+            "status": status,
+            "successful_preset_count": len(successful_rows),
+            "failed_preset_count": len(failed_rows),
+            "presets_requested": list(presets_requested),
+            "presets_observed": seen_presets,
+        }
+    return ticker_results
+
+
+def _run_full_research_workflow(
+    *,
+    args: argparse.Namespace,
+    config: BasketRunConfig,
+    compare_presets: list[str],
+) -> dict[str, Any]:
+    if not args.tickers:
+        raise SystemExit("--full-research-workflow requires --tickers.")
+    if len(config.tickers) > 1 and args.validation_output:
+        raise SystemExit("--validation-output can only be used with one ticker in --full-research-workflow mode.")
+    if config.dry_run:
+        raise SystemExit("--dry-run is incompatible with --full-research-workflow because no research artifacts would be generated.")
+    if config.data_check_only:
+        raise SystemExit(
+            "--data-check-only is incompatible with --full-research-workflow because current behavior only validates data reachability and does not produce research packets."
+        )
+    journal_path = _full_workflow_research_journal_path(args, config)
+    watchlist_output_path = _full_workflow_watchlist_markdown_path(args, config)
+
+    comparison_artifacts = run_preset_comparison(config, compare_presets)
+    research_artifacts = write_research_packet(
+        comparison_artifacts.run_dir,
+        config=config,
+        comparison_rows=comparison_artifacts.rows,
+        preset_run_dirs=comparison_artifacts.preset_run_dirs,
+    )
+    journal_artifacts = append_research_journal(
+        research_artifacts,
+        journal_path=journal_path,
+    )
+    _write_compare_summary(
+        comparison_artifacts.run_dir / "run_summary.md",
+        config=config,
+        run_dir=comparison_artifacts.run_dir,
+        comparison_rows=comparison_artifacts.rows,
+        research_journal_path=journal_artifacts.journal_path,
+    )
+
+    watchlist_artifacts = build_research_watchlist(
+        journal_path=journal_artifacts.journal_path,
+        output_path=watchlist_output_path,
+    )
+
+    ticker_results = _full_workflow_ticker_results(
+        tickers=list(config.tickers),
+        comparison_rows=comparison_artifacts.rows,
+        presets_requested=compare_presets,
+    )
+    successful_tickers = [ticker for ticker, result in ticker_results.items() if result["status"] == "success"]
+    partial_failure_tickers = [ticker for ticker, result in ticker_results.items() if result["status"] == "partial_failure"]
+    failed_tickers = [ticker for ticker, result in ticker_results.items() if result["status"] == "failed"]
+    missing_tickers = [ticker for ticker, result in ticker_results.items() if result["status"] == "missing"]
+
+    validation_checklists: dict[str, dict[str, str]] = {}
+    warnings: list[str] = []
+    if partial_failure_tickers:
+        warnings.append(
+            "Partial success: one or more presets failed for "
+            + ", ".join(f"`{ticker}`" for ticker in partial_failure_tickers)
+            + ", so downstream artifacts summarize incomplete comparisons."
+        )
+    if failed_tickers:
+        warnings.append(
+            "Failed tickers: "
+            + ", ".join(f"`{ticker}`" for ticker in failed_tickers)
+            + " had no successful preset comparisons."
+        )
+    if missing_tickers:
+        warnings.append(
+            "Missing comparison rows: "
+            + ", ".join(f"`{ticker}`" for ticker in missing_tickers)
+            + " did not appear in preset comparison output."
+        )
+    warnings.extend(watchlist_artifacts.warnings)
+    for ticker in config.tickers:
+        validation_artifacts = build_validation_checklist(
+            ticker=ticker,
+            journal_path=journal_artifacts.journal_path,
+            watchlist_path=watchlist_artifacts.json_path,
+            output_path=_full_workflow_validation_output_path(args, config, ticker=ticker),
+        )
+        validation_checklists[ticker] = {
+            "markdown": validation_artifacts.markdown_path.as_posix(),
+            "json": validation_artifacts.json_path.as_posix(),
+        }
+        warnings.extend(validation_artifacts.warnings)
+
+    if failed_tickers or missing_tickers:
+        workflow_status = "failed" if len(failed_tickers) + len(missing_tickers) == len(config.tickers) else "partial_success"
+    elif partial_failure_tickers:
+        workflow_status = "partial_success"
+    else:
+        workflow_status = "success"
+
+    successful_comparison_rows = [
+        row for row in comparison_artifacts.rows if str(row.get("run_status") or "").strip().lower() == "success"
+    ]
+    failed_comparison_rows = [
+        row for row in comparison_artifacts.rows if str(row.get("run_status") or "").strip().lower() != "success"
+    ]
+
+    return {
+        "run_dir": comparison_artifacts.run_dir.as_posix(),
+        "workflow_status": workflow_status,
+        "tickers": list(config.tickers),
+        "requested_presets": list(compare_presets),
+        "preset_run_dirs": comparison_artifacts.preset_run_dirs,
+        "comparison_row_count": len(comparison_artifacts.rows),
+        "successful_comparison_row_count": len(successful_comparison_rows),
+        "failed_comparison_row_count": len(failed_comparison_rows),
+        "successful_tickers": successful_tickers,
+        "partial_failure_tickers": partial_failure_tickers,
+        "failed_tickers": failed_tickers,
+        "missing_tickers": missing_tickers,
+        "ticker_results": ticker_results,
+        "preset_comparison_csv": comparison_artifacts.csv_path.as_posix(),
+        "preset_comparison_md": comparison_artifacts.markdown_path.as_posix(),
+        "research_packet_md": research_artifacts.markdown_path.as_posix(),
+        "research_packet_json": research_artifacts.json_path.as_posix(),
+        "research_journal_csv": journal_artifacts.journal_path.as_posix(),
+        "research_journal_rows_written": journal_artifacts.rows_written,
+        "research_watchlist_md": watchlist_artifacts.markdown_path.as_posix(),
+        "research_watchlist_json": watchlist_artifacts.json_path.as_posix(),
+        "research_watchlist_rows_reviewed": watchlist_artifacts.rows_reviewed,
+        "research_watchlist_ticker_count": watchlist_artifacts.ticker_count,
+        "validation_checklists": validation_checklists,
+        "validation_checklist_count": len(validation_checklists),
+        "warnings": _dedupe_warnings(warnings),
+    }
 
 
 def main() -> int:
@@ -1273,6 +1516,20 @@ def main() -> int:
         fast_data_mode=args.fast_data_mode,
         offline_demo_data=args.offline_demo_data,
     )
+
+    if args.full_research_workflow:
+        workflow_presets = compare_presets or ["technical-only", "core", "no-news", "all"]
+        print(
+            json.dumps(
+                _run_full_research_workflow(
+                    args=args,
+                    config=config,
+                    compare_presets=workflow_presets,
+                ),
+                indent=2,
+            )
+        )
+        return 0
 
     if compare_presets:
         artifacts = run_preset_comparison(config, compare_presets)

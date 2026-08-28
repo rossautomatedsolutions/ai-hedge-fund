@@ -4,6 +4,7 @@ import csv
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -224,6 +225,23 @@ def _assert_repo_review_outputs_unchanged(snapshot: dict[Path, bytes | None]) ->
             assert path.read_bytes() == original_bytes
 
 
+def _repo_journal_output_paths() -> list[Path]:
+    return [Path("outputs") / "research_journal.csv"]
+
+
+def _snapshot_repo_journal_outputs() -> dict[Path, bytes | None]:
+    return {path: path.read_bytes() if path.exists() else None for path in _repo_journal_output_paths()}
+
+
+def _assert_repo_journal_outputs_unchanged(snapshot: dict[Path, bytes | None]) -> None:
+    for path, original_bytes in snapshot.items():
+        if original_bytes is None:
+            assert not path.exists()
+        else:
+            assert path.exists()
+            assert path.read_bytes() == original_bytes
+
+
 def _repo_watchlist_output_paths() -> list[Path]:
     return [
         Path("outputs") / "research_watchlist.md",
@@ -324,6 +342,13 @@ def test_build_arg_parser_accepts_research_packet_flag() -> None:
     args = build_arg_parser().parse_args(["--tickers", "BB", "--research-packet"])
 
     assert args.research_packet is True
+
+
+def test_build_arg_parser_accepts_full_research_workflow_flag() -> None:
+    args = build_arg_parser().parse_args(["--full-research-workflow", "--tickers", "BB,GME"])
+
+    assert args.full_research_workflow is True
+    assert args.tickers == "BB,GME"
 
 
 def test_build_arg_parser_accepts_research_journal_flags() -> None:
@@ -2239,6 +2264,485 @@ def test_review_human_reviews_mode_does_not_run_analyst_data_workflow_or_append_
     assert output_path.exists()
     assert log_path.read_bytes() == original_log_bytes
     _assert_repo_human_review_summary_outputs_unchanged(snapshot)
+
+
+def test_full_research_workflow_creates_and_returns_expected_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run_dir = tmp_path / "workflow-run"
+    comparison_csv = run_dir / "preset_comparison.csv"
+    comparison_md = run_dir / "preset_comparison.md"
+    comparison_rows = _comparison_rows_for_tickers(run_dir, ["BB"])
+
+    def fake_run_preset_comparison(config: BasketRunConfig, presets: list[str]) -> SimpleNamespace:
+        run_dir.mkdir(parents=True, exist_ok=True)
+        comparison_csv.write_text("ticker\nBB\n", encoding="utf-8")
+        comparison_md.write_text("# Preset Comparison\n", encoding="utf-8")
+        return SimpleNamespace(
+            run_dir=run_dir,
+            csv_path=comparison_csv,
+            markdown_path=comparison_md,
+            rows=comparison_rows,
+            preset_run_dirs={preset: (run_dir / "preset_runs" / preset).as_posix() for preset in presets},
+        )
+
+    monkeypatch.setattr("src.basket_runner.run_preset_comparison", fake_run_preset_comparison)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "basket_runner.py",
+            "--full-research-workflow",
+            "--tickers",
+            "BB",
+            "--compare-presets",
+            "technical-only,core,no-news,all",
+            "--output-dir",
+            str(tmp_path),
+            "--research-journal-path",
+            str(tmp_path / "custom_journal.csv"),
+            "--watchlist-output",
+            str(tmp_path / "reports" / "watchlist.md"),
+            "--validation-output",
+            str(tmp_path / "reports" / "validation_checklist_BB.md"),
+            "--offline-demo-data",
+            "--continue-on-error",
+            "--fast-data-mode",
+        ],
+    )
+
+    assert main() == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["run_dir"] == run_dir.as_posix()
+    assert payload["workflow_status"] == "success"
+    assert payload["tickers"] == ["BB"]
+    assert payload["requested_presets"] == ["technical-only", "core", "no-news", "all"]
+    assert payload["comparison_row_count"] == 4
+    assert payload["successful_comparison_row_count"] == 4
+    assert payload["failed_comparison_row_count"] == 0
+    assert payload["successful_tickers"] == ["BB"]
+    assert payload["partial_failure_tickers"] == []
+    assert payload["failed_tickers"] == []
+    assert payload["missing_tickers"] == []
+    assert payload["ticker_results"]["BB"]["status"] == "success"
+    assert payload["preset_comparison_csv"] == comparison_csv.as_posix()
+    assert payload["preset_comparison_md"] == comparison_md.as_posix()
+    assert Path(payload["research_packet_md"]).exists()
+    assert Path(payload["research_packet_json"]).exists()
+    assert payload["research_journal_csv"] == (tmp_path / "custom_journal.csv").as_posix()
+    assert Path(payload["research_journal_csv"]).exists()
+    assert payload["research_journal_rows_written"] == 1
+    assert payload["research_watchlist_md"] == (tmp_path / "reports" / "watchlist.md").as_posix()
+    assert payload["research_watchlist_json"] == (tmp_path / "reports" / "watchlist.json").as_posix()
+    assert Path(payload["research_watchlist_md"]).exists()
+    assert Path(payload["research_watchlist_json"]).exists()
+    assert payload["research_watchlist_rows_reviewed"] == 1
+    assert payload["research_watchlist_ticker_count"] == 1
+    assert set(payload["validation_checklists"]) == {"BB"}
+    assert payload["validation_checklist_count"] == 1
+    assert Path(payload["validation_checklists"]["BB"]["markdown"]).exists()
+    assert Path(payload["validation_checklists"]["BB"]["json"]).exists()
+    assert any("offline_demo data" in warning for warning in payload["warnings"])
+
+    packet_markdown = Path(payload["research_packet_md"]).read_text(encoding="utf-8")
+    watchlist_markdown = Path(payload["research_watchlist_md"]).read_text(encoding="utf-8")
+    validation_markdown = Path(payload["validation_checklists"]["BB"]["markdown"]).read_text(encoding="utf-8")
+
+    assert DECISION_SUMMARY_DISCLAIMER in packet_markdown
+    assert OFFLINE_DEMO_DISCLAIMER in packet_markdown
+    assert DECISION_SUMMARY_DISCLAIMER in watchlist_markdown
+    assert DECISION_SUMMARY_DISCLAIMER in validation_markdown
+    assert "current-data validation is required" in validation_markdown
+
+
+def test_full_research_workflow_defaults_compare_presets_when_omitted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    observed: dict[str, object] = {}
+
+    def fake_run_preset_comparison(config: BasketRunConfig, presets: list[str]) -> SimpleNamespace:
+        observed["presets"] = list(presets)
+        observed["continue_on_error"] = config.continue_on_error
+        run_dir = tmp_path / "workflow-run"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        return SimpleNamespace(
+            run_dir=run_dir,
+            csv_path=run_dir / "preset_comparison.csv",
+            markdown_path=run_dir / "preset_comparison.md",
+            rows=[],
+            preset_run_dirs={},
+        )
+
+    monkeypatch.setattr("src.basket_runner.run_preset_comparison", fake_run_preset_comparison)
+    monkeypatch.setattr(
+        "src.basket_runner.write_research_packet",
+        lambda *args, **kwargs: SimpleNamespace(
+            markdown_path=tmp_path / "research_packet.md",
+            json_path=tmp_path / "research_packet.json",
+            payload={},
+        ),
+    )
+    monkeypatch.setattr(
+        "src.basket_runner.append_research_journal",
+        lambda *args, **kwargs: SimpleNamespace(journal_path=tmp_path / "research_journal.csv", rows_written=0),
+    )
+    monkeypatch.setattr(
+        "src.basket_runner.build_research_watchlist",
+        lambda *args, **kwargs: SimpleNamespace(
+            journal_path=tmp_path / "research_journal.csv",
+            markdown_path=tmp_path / "research_watchlist.md",
+            json_path=tmp_path / "research_watchlist.json",
+            rows_reviewed=0,
+            ticker_count=0,
+            warnings=[],
+        ),
+    )
+    monkeypatch.setattr(
+        "src.basket_runner.build_validation_checklist",
+        lambda *args, **kwargs: SimpleNamespace(
+            journal_path=tmp_path / "research_journal.csv",
+            watchlist_path=tmp_path / "research_watchlist.json",
+            markdown_path=tmp_path / "validation_checklist_BB.md",
+            json_path=tmp_path / "validation_checklist_BB.json",
+            ticker="BB",
+            warnings=[],
+        ),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "basket_runner.py",
+            "--full-research-workflow",
+            "--tickers",
+            "BB",
+            "--continue-on-error",
+        ],
+    )
+
+    assert main() == 0
+    json.loads(capsys.readouterr().out)
+    assert observed["presets"] == ["technical-only", "core", "no-news", "all"]
+    assert observed["continue_on_error"] is True
+
+
+def test_full_research_workflow_multiple_tickers_create_multiple_validation_checklists(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run_dir = tmp_path / "workflow-run"
+    comparison_rows = _comparison_rows_for_tickers(run_dir, ["BB", "GME"])
+
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.setattr(
+        "src.basket_runner.run_preset_comparison",
+        lambda config, presets: SimpleNamespace(
+            run_dir=run_dir,
+            csv_path=run_dir / "preset_comparison.csv",
+            markdown_path=run_dir / "preset_comparison.md",
+            rows=comparison_rows,
+            preset_run_dirs={preset: (run_dir / "preset_runs" / preset).as_posix() for preset in presets},
+        ),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "basket_runner.py",
+            "--full-research-workflow",
+            "--tickers",
+            "BB,GME",
+            "--compare-presets",
+            "technical-only,core",
+            "--output-dir",
+            str(tmp_path),
+            "--offline-demo-data",
+        ],
+    )
+
+    assert main() == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    assert set(payload["validation_checklists"]) == {"BB", "GME"}
+    assert Path(payload["validation_checklists"]["BB"]["markdown"]).exists()
+    assert Path(payload["validation_checklists"]["GME"]["markdown"]).exists()
+
+
+def test_full_research_workflow_uses_output_dir_for_default_secondary_artifacts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    workflow_output_dir = tmp_path / "owner_smoke"
+    run_dir = workflow_output_dir / "workflow-run"
+    comparison_rows = _comparison_rows_for_tickers(run_dir, ["BB"])
+    journal_snapshot = _snapshot_repo_journal_outputs()
+    watchlist_snapshot = _snapshot_repo_watchlist_outputs()
+    validation_snapshot = _snapshot_repo_validation_outputs()
+
+    run_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(
+        "src.basket_runner.run_preset_comparison",
+        lambda config, presets: SimpleNamespace(
+            run_dir=run_dir,
+            csv_path=run_dir / "preset_comparison.csv",
+            markdown_path=run_dir / "preset_comparison.md",
+            rows=comparison_rows,
+            preset_run_dirs={preset: (run_dir / "preset_runs" / preset).as_posix() for preset in presets},
+        ),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "basket_runner.py",
+            "--full-research-workflow",
+            "--tickers",
+            "BB",
+            "--output-dir",
+            str(workflow_output_dir),
+            "--offline-demo-data",
+        ],
+    )
+
+    assert main() == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["workflow_status"] == "success"
+    assert payload["research_journal_csv"] == (workflow_output_dir / "research_journal.csv").as_posix()
+    assert payload["research_watchlist_md"] == (workflow_output_dir / "research_watchlist.md").as_posix()
+    assert payload["research_watchlist_json"] == (workflow_output_dir / "research_watchlist.json").as_posix()
+    assert payload["validation_checklists"]["BB"]["markdown"] == (
+        workflow_output_dir / "validation_checklist_BB.md"
+    ).as_posix()
+    assert payload["validation_checklists"]["BB"]["json"] == (
+        workflow_output_dir / "validation_checklist_BB.json"
+    ).as_posix()
+    assert payload["run_dir"].startswith(workflow_output_dir.as_posix())
+    assert payload["preset_comparison_csv"].startswith(workflow_output_dir.as_posix())
+    assert payload["research_packet_md"].startswith(workflow_output_dir.as_posix())
+    assert payload["research_journal_csv"].startswith(workflow_output_dir.as_posix())
+    assert payload["research_watchlist_md"].startswith(workflow_output_dir.as_posix())
+    assert payload["validation_checklists"]["BB"]["markdown"].startswith(workflow_output_dir.as_posix())
+    _assert_repo_journal_outputs_unchanged(journal_snapshot)
+    _assert_repo_watchlist_outputs_unchanged(watchlist_snapshot)
+    _assert_repo_validation_outputs_unchanged(validation_snapshot)
+
+
+def test_full_research_workflow_reports_partial_failure_diagnostics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run_dir = tmp_path / "workflow-run"
+    comparison_rows = _comparison_rows_for_tickers(run_dir, ["BB"])
+    comparison_rows[1]["action"] = "FAILED"
+    comparison_rows[1]["confidence"] = "-"
+    comparison_rows[1]["reasoning"] = "Run failed after passing data checks: upstream timeout."
+    comparison_rows[1]["run_status"] = "failed"
+    comparison_rows[1]["failure_classification"] = "timeout"
+
+    run_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(
+        "src.basket_runner.run_preset_comparison",
+        lambda config, presets: SimpleNamespace(
+            run_dir=run_dir,
+            csv_path=run_dir / "preset_comparison.csv",
+            markdown_path=run_dir / "preset_comparison.md",
+            rows=comparison_rows,
+            preset_run_dirs={preset: (run_dir / "preset_runs" / preset).as_posix() for preset in presets},
+        ),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "basket_runner.py",
+            "--full-research-workflow",
+            "--tickers",
+            "BB",
+            "--output-dir",
+            str(tmp_path / "owner_smoke"),
+            "--offline-demo-data",
+            "--continue-on-error",
+        ],
+    )
+
+    assert main() == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["workflow_status"] == "partial_success"
+    assert payload["successful_comparison_row_count"] == 3
+    assert payload["failed_comparison_row_count"] == 1
+    assert payload["successful_tickers"] == []
+    assert payload["partial_failure_tickers"] == ["BB"]
+    assert payload["failed_tickers"] == []
+    assert payload["missing_tickers"] == []
+    assert payload["ticker_results"]["BB"]["status"] == "partial_failure"
+    assert payload["ticker_results"]["BB"]["successful_preset_count"] == 3
+    assert payload["ticker_results"]["BB"]["failed_preset_count"] == 1
+    assert any(warning.startswith("Partial success:") for warning in payload["warnings"])
+
+
+def test_full_research_workflow_validation_output_with_multiple_tickers_fails_clearly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "src.basket_runner.run_preset_comparison",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("workflow should fail before comparison starts")),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "basket_runner.py",
+            "--full-research-workflow",
+            "--tickers",
+            "BB,GME",
+            "--validation-output",
+            str(tmp_path / "reports" / "validation.md"),
+        ],
+    )
+
+    with pytest.raises(SystemExit, match="--validation-output can only be used with one ticker"):
+        main()
+
+
+def test_full_research_workflow_requires_tickers(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "src.basket_runner.run_preset_comparison",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("workflow should fail before comparison starts")),
+    )
+    monkeypatch.setattr(sys, "argv", ["basket_runner.py", "--full-research-workflow"])
+
+    with pytest.raises(SystemExit, match="--full-research-workflow requires --tickers"):
+        main()
+
+
+def test_full_research_workflow_rejects_dry_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "src.basket_runner.run_preset_comparison",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("workflow should fail before comparison starts")),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["basket_runner.py", "--full-research-workflow", "--tickers", "BB", "--dry-run"],
+    )
+
+    with pytest.raises(SystemExit, match="--dry-run is incompatible with --full-research-workflow"):
+        main()
+
+
+def test_full_research_workflow_rejects_data_check_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "src.basket_runner.run_preset_comparison",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("workflow should fail before comparison starts")),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["basket_runner.py", "--full-research-workflow", "--tickers", "BB", "--data-check-only"],
+    )
+
+    with pytest.raises(SystemExit, match="--data-check-only is incompatible with --full-research-workflow"):
+        main()
+
+
+def test_full_research_workflow_rejects_mismatched_watchlist_output_and_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "src.basket_runner.run_preset_comparison",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("workflow should fail before comparison starts")),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "basket_runner.py",
+            "--full-research-workflow",
+            "--tickers",
+            "BB",
+            "--watchlist-output",
+            str(tmp_path / "watchlist.md"),
+            "--watchlist-path",
+            str(tmp_path / "other_watchlist.json"),
+        ],
+    )
+
+    with pytest.raises(SystemExit, match="--watchlist-output and --watchlist-path must refer to the same companion JSON path"):
+        main()
+
+
+def test_full_research_workflow_custom_watchlist_output_is_respected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    observed: dict[str, object] = {}
+    run_dir = tmp_path / "workflow-run"
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.setattr(
+        "src.basket_runner.run_preset_comparison",
+        lambda config, presets: SimpleNamespace(
+            run_dir=run_dir,
+            csv_path=run_dir / "preset_comparison.csv",
+            markdown_path=run_dir / "preset_comparison.md",
+            rows=[],
+            preset_run_dirs={},
+        ),
+    )
+    monkeypatch.setattr(
+        "src.basket_runner.write_research_packet",
+        lambda *args, **kwargs: SimpleNamespace(
+            markdown_path=tmp_path / "research_packet.md",
+            json_path=tmp_path / "research_packet.json",
+            payload={},
+        ),
+    )
+    monkeypatch.setattr(
+        "src.basket_runner.append_research_journal",
+        lambda *args, **kwargs: SimpleNamespace(journal_path=tmp_path / "research_journal.csv", rows_written=0),
+    )
+
+    def fake_build_research_watchlist(*, journal_path, output_path):
+        observed["output_path"] = output_path
+        return SimpleNamespace(
+            journal_path=Path(journal_path),
+            markdown_path=Path(output_path),
+            json_path=Path(output_path).with_suffix(".json"),
+            rows_reviewed=0,
+            ticker_count=0,
+            warnings=[],
+        )
+
+    monkeypatch.setattr("src.basket_runner.build_research_watchlist", fake_build_research_watchlist)
+    monkeypatch.setattr(
+        "src.basket_runner.build_validation_checklist",
+        lambda *args, **kwargs: SimpleNamespace(
+            journal_path=tmp_path / "research_journal.csv",
+            watchlist_path=tmp_path / "custom_watchlist.json",
+            markdown_path=tmp_path / "validation_checklist_BB.md",
+            json_path=tmp_path / "validation_checklist_BB.json",
+            ticker="BB",
+            warnings=[],
+        ),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "basket_runner.py",
+            "--full-research-workflow",
+            "--tickers",
+            "BB",
+            "--watchlist-output",
+            str(tmp_path / "custom_watchlist.md"),
+        ],
+    )
+
+    assert main() == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert observed["output_path"] == str(tmp_path / "custom_watchlist.md")
+    assert payload["research_watchlist_md"] == (tmp_path / "custom_watchlist.md").as_posix()
+    assert payload["research_watchlist_json"] == (tmp_path / "custom_watchlist.json").as_posix()
 
 
 def test_main_without_compare_presets_keeps_single_preset_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

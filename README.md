@@ -129,6 +129,64 @@ poetry run python src/backtester.py --ticker AAPL,MSFT,NVDA
 
 Note: The `--ollama`, `--start-date`, and `--end-date` flags work for the backtester, as well!
 
+#### Research Workflow CLI
+
+`src/basket_runner.py` is the bounded research workflow CLI for educational basket analysis, preset comparison, and human review preparation. It does not place live trades, submit broker orders, or mutate external brokerage accounts.
+
+Install the project dependencies first:
+
+```bash
+poetry install
+```
+
+Show the supported options:
+
+```bash
+poetry run python -B -m src.basket_runner --help
+```
+
+Run the full research-only workflow for one or more tickers:
+
+```bash
+poetry run python -B -m src.basket_runner --full-research-workflow --tickers BB,GME --offline-demo-data --continue-on-error --output-dir outputs\owner_smoke
+```
+
+`--full-research-workflow` coordinates the existing research components in one path:
+
+- preset comparison across analyst presets
+- `research_packet.md` and `research_packet.json`
+- durable `research_journal.csv` append
+- `research_watchlist.md` and `research_watchlist.json` refresh
+- per-ticker `validation_checklist_<TICKER>.md` and `.json`
+- existing human-review preparation, with optional later use of `--record-human-review` and `--review-human-reviews`
+
+Useful standalone follow-up commands:
+
+```bash
+poetry run python -B -m src.basket_runner --research-watchlist --research-journal-path outputs\research_journal.csv
+poetry run python -B -m src.basket_runner --validation-checklist --ticker BB --research-journal-path outputs\research_journal.csv --watchlist-path outputs\research_watchlist.json
+poetry run python -B -m src.basket_runner --review-human-reviews --human-review-log-path outputs\human_review_log.csv
+```
+
+Output behavior:
+
+- If you pass `--output-dir`, the timestamped basket comparison run is written under `<output-dir>\<timestamp>\...`.
+- In `--full-research-workflow` mode, the durable journal/watchlist/validation files default to the same `--output-dir` root unless you explicitly override their paths.
+- If you do not pass `--output-dir`, the workflow keeps the existing repo-level defaults under `outputs\`.
+- Generated output artifacts stay out of tracked source directories, and `outputs/` remains ignored by git.
+
+Journal and partial-failure behavior:
+
+- The research journal is append-only. This task does not add a new deduplication scheme because no existing identity/deduplication contract was present in the workflow helpers.
+- `--continue-on-error` keeps the workflow moving when one or more preset runs fail, and the JSON result reports `workflow_status`, failed/partial tickers, and warning messages so incomplete research is not mistaken for a clean success.
+- `--offline-demo-data` is supported for bounded demos and smoke tests, but those artifacts still require current-data validation before any real-world interpretation.
+
+Repository boundary:
+
+- This repository is research-only and does not place live trades.
+- `finance_decision_engine` remains a separate deterministic evidence/decision repository.
+- No AI Hedge Fund to `finance_decision_engine` integration is being implemented in this workflow task.
+
 ### 🖥️ Web Application
 
 The new way to run the AI Hedge Fund is through our web application that provides a user-friendly interface. This is recommended for users who prefer visual interfaces over command line tools.
